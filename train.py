@@ -50,6 +50,13 @@ def main():
     model = ST_VSR_Network().to(device)
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
+    # 🚀 PyTorch 2.0+ 编译优化 (免费提速 10%~20%)
+    try:
+        model = torch.compile(model)
+        print("✅ 模型已启用 torch.compile 编译优化！")
+    except Exception as e:
+        print(f"⚠️ torch.compile 启用失败 (可能是 PyTorch 版本过低): {e}")
+    
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
     # 初始化训练集
     train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=128)
@@ -119,7 +126,7 @@ def main():
             coords_xyt = coords_xyt.to(device)       
             gt_rgb_points = gt_rgb_points.to(device) 
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
             # ==============================================================
             # 纯 FP32 正向传播
@@ -135,7 +142,12 @@ def main():
             gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)
             
             loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean()
-            loss = loss_l1 + 0.1 * loss_perceptual
+            
+            # ========== 【新增：感知损失预热 (Warm-up)】 ========== 
+            # 前 10 个 Epoch 专注结构恢复，10 轮之后再激活感知损失 
+            weight_lpips = 0.1 if epoch > 10 else 0.0 
+            loss = loss_l1 + weight_lpips * loss_perceptual 
+            # ====================================================
             
             # 使用截断范围计算训练集 PSNR
             with torch.no_grad():

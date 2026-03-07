@@ -49,12 +49,21 @@ class ST_VSR_Network(nn.Module):
         self.encoder.eval()
         
         self.t_aiem = T_AIEM(channels=16)
+        
+        # ========== 【新增：局部上下文特征增强层】 ========== 
+        # 提取 3x3 范围的局部结构，并从 16 维升维到 64 维 
+        self.feat_proj = nn.Sequential( 
+            nn.Conv2d(16, 64, 3, 1, 1), 
+            nn.LeakyReLU(0.2, True), 
+            nn.Conv2d(64, 64, 3, 1, 1) 
+        ) 
+        # ================================================= 
+        
         self.pe = PositionalEncoding3D(num_freqs=10)
         
-        # 回归最本真、最轻量的 79 维结构
-        # 将 GELU 替换为 Sine，增强高频纹理生成能力 
+        # 维度调整：64(特征) + 63(坐标) = 127 
         self.inr_mlp = nn.Sequential( 
-            nn.Linear(79, 256), Sine(), 
+            nn.Linear(127, 256), Sine(), 
             nn.Linear(256, 256), Sine(), 
             nn.Linear(256, 3) 
         )
@@ -62,8 +71,7 @@ class ST_VSR_Network(nn.Module):
         # ========== 【新增：SIREN 专属数学初始化】 ========== 
         # 第一层：确保输入坐标频率的均匀分布 
         with torch.no_grad(): 
-            self.inr_mlp[0].weight.uniform_(-1 / 79, 1 / 79) 
-            # 隐藏层：根据正弦函数的特性，利用 w0 (30.0) 缩放方差 
+            self.inr_mlp[0].weight.uniform_(-1 / 127, 1 / 127)  # 改为 127 
             c = math.sqrt(6 / 256) / 30.0 
             self.inr_mlp[2].weight.uniform_(-c, c) 
             self.inr_mlp[4].weight.uniform_(-c, c) 
@@ -91,8 +99,11 @@ class ST_VSR_Network(nn.Module):
         
         fused_feat = self.t_aiem(f_prev, f_curr, f_next) 
         
-        spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
+        # ========== 【新增：应用局部上下文投影】 ========== 
+        fused_feat = self.feat_proj(fused_feat) 
+        # ================================================ 
         
+        spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
         sampled_feat = F.grid_sample(fused_feat, spatial_coords, align_corners=True)
         sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous()
         
