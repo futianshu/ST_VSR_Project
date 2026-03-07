@@ -44,10 +44,9 @@ class ST_VSR_Network(nn.Module):
         self.t_aiem = T_AIEM(channels=16)
         self.pe = PositionalEncoding3D(num_freqs=10)
         
-        # 🚀 护盾 1【硬件级防爆】：将 79 维升至 80 维！
-        # 完美匹配 Tensor Core 的 8 字节对齐要求，彻底免疫奇数维度带来的内存越界！
+        # 回归最本真、最轻量的 79 维结构
         self.inr_mlp = nn.Sequential(
-            nn.Linear(80, 256), nn.GELU(),  # <--- 这里把原来的 79 改成 80
+            nn.Linear(79, 256), nn.GELU(),
             nn.Linear(256, 256), nn.GELU(),
             nn.Linear(256, 3)
         )
@@ -61,8 +60,8 @@ class ST_VSR_Network(nn.Module):
             latents = []
             for i in range(B * T):
                 single_frame = lr_seq_input[i:i+1].contiguous()
-                with torch.amp.autocast('cuda', enabled=False):
-                    l = self.encoder.encode(single_frame.float()).latent_dist.mode()
+                # 🚀 剥离 autocast 后，这里也是纯 FP32 极速推理
+                l = self.encoder.encode(single_frame).latent_dist.mode()
                 latents.append(l)
             
             latent = torch.cat(latents, dim=0) * self.encoder.config.scaling_factor
@@ -75,31 +74,13 @@ class ST_VSR_Network(nn.Module):
         fused_feat = self.t_aiem(f_prev, f_curr, f_next) 
         
         spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
-        spatial_coords = spatial_coords.to(fused_feat.dtype)
         
         sampled_feat = F.grid_sample(fused_feat, spatial_coords, align_corners=False)
         sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous()
         
-        encoded_coords = self.pe(coords_xyt).to(sampled_feat.dtype) 
+        encoded_coords = self.pe(coords_xyt)
         
-        # 🚀 护盾 1【硬件级防爆】：在坐标最后补一个 0，强行把 63维 撑到 64维！
-        # 加上 16维特征，总计 80维！完美契合 Tensor Core 的 8 字节对齐要求！
-        encoded_coords = F.pad(encoded_coords, (0, 1), value=0.0).contiguous()
+        inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
+        pred_rgb_points = self.inr_mlp(inr_input) 
         
-        inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() # [B, N, 80]
-        
-        # =========================================================================
-        # 🚀 护盾 2【究极降维打击】：彻底解决 nn.Linear 3D 张量反向传播闪退的 Bug！
-        # 把 [8, 2304, 80] 拍扁成 2D 矩阵 [18432, 80]，
-        # 强制 cuBLAS 使用最基础、最稳如老狗的 2D 矩阵乘法核！
-        # =========================================================================
-        _B, _N, _D = inr_input.shape
-        inr_input_2d = inr_input.view(_B * _N, _D)
-        
-        # 用 2D 矩阵过 MLP，绝对不会有 stride 内存越界的问题，且计算速度更快！
-        pred_rgb_points_2d = self.inr_mlp(inr_input_2d) 
-        
-        # 算完之后，再安全地恢复成 3D 张量 [8, 2304, 3] 并确保显存连续
-        pred_rgb_points = pred_rgb_points_2d.view(_B, _N, 3).contiguous()
-            
         return pred_rgb_points
