@@ -59,6 +59,16 @@ class ST_VSR_Network(nn.Module):
             nn.Linear(256, 3) 
         )
         
+        # ========== 【新增：SIREN 专属数学初始化】 ========== 
+        # 第一层：确保输入坐标频率的均匀分布 
+        with torch.no_grad(): 
+            self.inr_mlp[0].weight.uniform_(-1 / 79, 1 / 79) 
+            # 隐藏层：根据正弦函数的特性，利用 w0 (30.0) 缩放方差 
+            c = math.sqrt(6 / 256) / 30.0 
+            self.inr_mlp[2].weight.uniform_(-c, c) 
+            self.inr_mlp[4].weight.uniform_(-c, c) 
+        # ===================================================
+        
     def forward(self, lr_seq, coords_xyt):
         B, T, C, H, W = lr_seq.shape
         
