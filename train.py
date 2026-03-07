@@ -50,12 +50,41 @@ def main():
     for param in loss_fn_vgg.parameters():
         param.requires_grad = False
         
+    # ==============================================================
+    # 🚀 定义优化器和调度器
+    # ==============================================================
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
+    epochs = 100
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    
+    # ==============================================================
+    # 🚀 断点续训逻辑 (未来如果需要恢复，只需修改 resume_epoch)
+    # ==============================================================
+    resume_epoch = 0  # 🌟 本次设为 0 从头开始；未来若在第 30 轮断开，改为 30 即可恢复
+    start_epoch = 1
+    
+    if resume_epoch > 0:
+        checkpoint_path = f"checkpoints/st_vsr_epoch_{resume_epoch}.pth"
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # 恢复模型权重
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            
+            # 恢复优化器和调度器状态（无损续训的关键）
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"✅ 成功加载完整断点：{checkpoint_path}，准备从 Epoch {start_epoch} 继续！")
+        else:
+            print(f"⚠️ 警告：未找到 {checkpoint_path}，将从头开始训练！")
     
     print("🔥 真实世界时空联合训练正式开始！")
     
-    epochs = 100
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         
@@ -67,7 +96,7 @@ def main():
             optimizer.zero_grad()
             
             # ==============================================================
-            # 🚀 剥离花里胡哨的 autocast，纯 FP32 正向传播，绝对稳如老狗！
+            # 纯 FP32 正向传播
             # ==============================================================
             pred_rgb = model(lr_seq, coords_xyt) 
             
@@ -80,18 +109,44 @@ def main():
             
             loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean()
             loss = loss_l1 + 0.1 * loss_perceptual
+            
+            # ==============================================================
+            # 🚀 计算 PSNR (峰值信噪比)
+            # ==============================================================
+            mse_loss = F.mse_loss(pred_rgb, gt_rgb_points)
+            psnr = 10 * torch.log10(1.0 / (mse_loss + 1e-8))
                 
-            # ==============================================================
-            # 🚀 剥离 GradScaler，纯 FP32 原生计算梯度，彻底消灭底层硬件 Bug！
-            # ==============================================================
+            # 反向传播与优化
             loss.backward()
             optimizer.step()
             
-            pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'L1': f"{loss_l1.item():.4f}", 'LPIPS': f"{loss_perceptual.item():.4f}"})
+            # 更新进度条信息 (新增 PSNR 和 当前的学习率 LR)
+            current_lr = optimizer.param_groups[0]['lr']
+            pbar.set_postfix({
+                'Loss': f"{loss.item():.4f}", 
+                'L1': f"{loss_l1.item():.4f}", 
+                'LPIPS': f"{loss_perceptual.item():.4f}",
+                'PSNR': f"{psnr.item():.2f}",
+                'LR': f"{current_lr:.2e}"
+            })
             
-        save_dict = {k: v for k, v in model.state_dict().items() if 'encoder' not in k}
-        torch.save(save_dict, f"checkpoints/st_vsr_epoch_{epoch}.pth")
-        print(f"✅ Epoch {epoch} 轻量化模型已保存。")
+        # ==============================================================
+        # 🚀 Epoch 结束后：调度器步进 & 完整 Checkpoint 保存
+        # ==============================================================
+        scheduler.step()
+        
+        # 排除无需保存的 encoder 参数
+        model_save_dict = {k: v for k, v in model.state_dict().items() if 'encoder' not in k}
+        
+        # 打包保存所有关键状态
+        checkpoint_dict = {
+            'epoch': epoch,
+            'model_state_dict': model_save_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict()
+        }
+        torch.save(checkpoint_dict, f"checkpoints/st_vsr_epoch_{epoch}.pth")
+        print(f"✅ Epoch {epoch} Checkpoint（含模型权重及优化器状态）已保存。")
 
 if __name__ == '__main__':
     main()
