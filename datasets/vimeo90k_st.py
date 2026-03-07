@@ -58,6 +58,24 @@ class Vimeo90K_ST_Dataset(Dataset):
         x0 = random.randint(0, W_hr - self.patch_size)
         gt_patch = gt_hr_full[:, y0:y0+self.patch_size, x0:x0+self.patch_size]
         
+        # ========== 【新增：时空数据增强】 ========== 
+        # 水平翻转 
+        if random.random() < 0.5: 
+            lr_tensor = torch.flip(lr_tensor, dims=[2]) # 宽维度 
+            gt_patch = torch.flip(gt_patch, dims=[2]) 
+        
+        # 垂直翻转 
+        if random.random() < 0.5: 
+            lr_tensor = torch.flip(lr_tensor, dims=[1]) # 高维度 
+            gt_patch = torch.flip(gt_patch, dims=[1]) 
+            
+        # 时序反转 (Reverse) - 让网络学到正向和逆向运动 
+        if random.random() < 0.5: 
+            lr_tensor = torch.flip(lr_tensor, dims=[0]) # 时间维度 
+            # 注意：时序反转时，预测目标的时间戳也要取反 
+            t_q = -t_q 
+        # ========================================== 
+        
         # 5. 生成对应的 3D 时空坐标
         y_coords = (torch.arange(H_hr, dtype=torch.float32) / (H_hr - 1)) * 2 - 1
         x_coords = (torch.arange(W_hr, dtype=torch.float32) / (W_hr - 1)) * 2 - 1

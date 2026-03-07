@@ -14,6 +14,15 @@ from models.st_network import ST_VSR_Network
 from diffusers import StableDiffusion3Pipeline
 from utils.util import load_lora_state_dict
 
+class CharbonnierLoss(torch.nn.Module): 
+    def __init__(self, eps=1e-6): 
+        super(CharbonnierLoss, self).__init__() 
+        self.eps = eps 
+
+    def forward(self, x, y): 
+        diff = x - y 
+        return torch.mean(torch.sqrt(diff * diff + self.eps)) 
+
 def load_dpas_sr_prior(model, vae_safetensors_path):
     if os.path.exists(vae_safetensors_path):
         print(f"🚀 正在提取研究二的图像生成先验: {vae_safetensors_path}")
@@ -42,14 +51,18 @@ def main():
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
-    dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=48)
+    # 将 patch_size 从 48 提升到 128 
+    dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=128) 
     
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True)
     
     loss_fn_vgg = lpips.LPIPS(net='vgg').to(device).eval()
     for param in loss_fn_vgg.parameters():
         param.requires_grad = False
-        
+    
+    # 实例化 Loss 
+    charbonnier = CharbonnierLoss().to(device) 
+    
     # ==============================================================
     # 🚀 定义优化器和调度器
     # ==============================================================
@@ -100,9 +113,10 @@ def main():
             # ==============================================================
             pred_rgb = model(lr_seq, coords_xyt) 
             
-            loss_l1 = F.l1_loss(pred_rgb, gt_rgb_points)
+            # 将 F.l1_loss 替换为 charbonnier 
+            loss_l1 = charbonnier(pred_rgb, gt_rgb_points)
             
-            patch_size = 48
+            patch_size = 128  # 必须与 dataset 中的保持一致 
             B, N, _ = pred_rgb.shape
             pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)
             gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)

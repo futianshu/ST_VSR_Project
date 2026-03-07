@@ -83,7 +83,7 @@ class ST_VSR_Network(nn.Module):
         
         spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
         
-        sampled_feat = F.grid_sample(fused_feat, spatial_coords, align_corners=False)
+        sampled_feat = F.grid_sample(fused_feat, spatial_coords, align_corners=True)
         sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous()
         
         encoded_coords = self.pe(coords_xyt)
