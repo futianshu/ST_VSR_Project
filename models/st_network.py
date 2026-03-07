@@ -6,6 +6,13 @@ from diffusers.models import AutoencoderKL
 from peft import LoraConfig
 from models.t_aiem import T_AIEM
 
+class Sine(nn.Module):
+    def __init__(self, w0=30.0):
+        super().__init__()
+        self.w0 = w0
+    def forward(self, x):
+        return torch.sin(self.w0 * x)
+
 class PositionalEncoding3D(nn.Module):
     def __init__(self, num_freqs=10):
         super().__init__()
@@ -45,10 +52,11 @@ class ST_VSR_Network(nn.Module):
         self.pe = PositionalEncoding3D(num_freqs=10)
         
         # 回归最本真、最轻量的 79 维结构
-        self.inr_mlp = nn.Sequential(
-            nn.Linear(79, 256), nn.GELU(),
-            nn.Linear(256, 256), nn.GELU(),
-            nn.Linear(256, 3)
+        # 将 GELU 替换为 Sine，增强高频纹理生成能力 
+        self.inr_mlp = nn.Sequential( 
+            nn.Linear(79, 256), Sine(), 
+            nn.Linear(256, 256), Sine(), 
+            nn.Linear(256, 3) 
         )
         
     def forward(self, lr_seq, coords_xyt):
