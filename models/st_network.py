@@ -74,7 +74,10 @@ class ST_VSR_Network(nn.Module):
             self.inr_mlp[0].weight.uniform_(-1 / 127, 1 / 127)  # 改为 127 
             c = math.sqrt(6 / 256) / 30.0 
             self.inr_mlp[2].weight.uniform_(-c, c) 
-            self.inr_mlp[4].weight.uniform_(-c, c) 
+            
+            # 🔥 预测残差的层，初始化为极小值，让初始输出几乎为 0，收敛会极其顺滑 
+            self.inr_mlp[4].weight.uniform_(-1e-5, 1e-5) 
+            self.inr_mlp[4].bias.zero_()
         # ===================================================
         
     def forward(self, lr_seq, coords_xyt, chunk_size=None):
@@ -83,14 +86,11 @@ class ST_VSR_Network(nn.Module):
         with torch.no_grad():
             lr_seq_input = lr_seq.reshape(B*T, C, H, W) * 2.0 - 1.0
             
-            latents = []
-            for i in range(B * T):
-                single_frame = lr_seq_input[i:i+1].contiguous()
-                # 🚀 剥离 autocast 后，这里也是纯 FP32 极速推理
-                l = self.encoder.encode(single_frame).latent_dist.mode()
-                latents.append(l)
+            # 🔥 取消 for 循环！开启 bfloat16 混合精度并行提取！ 
+            with torch.autocast('cuda', dtype=torch.bfloat16): 
+                latent = self.encoder.encode(lr_seq_input).latent_dist.mode() 
             
-            latent = torch.cat(latents, dim=0) * self.encoder.config.scaling_factor
+            latent = latent.float() * self.encoder.config.scaling_factor 
             latent = latent.reshape(B, T, 16, H // 8, W // 8)
             
             f_prev = latent[:, 0].contiguous()

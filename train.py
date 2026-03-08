@@ -18,6 +18,10 @@ from skimage.metrics import structural_similarity as ssim_func
 import numpy as np 
 import math
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn 
+import cv2 
+# 🔥 防止 Dataloader 多进程和 OpenCV 内部多线程冲突 
+cv2.setNumThreads(0) 
+cv2.ocl.setUseOpenCL(False) 
 
 class CharbonnierLoss(torch.nn.Module): 
     def __init__(self, eps=1e-6): 
@@ -71,9 +75,14 @@ def main():
     # ==============================================================
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
     train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=128)
-    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True)
+    # 增加 persistent_workers=True 保持进程存活，Epoch 切换零延迟 
+    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     val_dataset = Vimeo90K_ST_Val_Dataset(data_root=vimeo_root, scale=4)
-    val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+    
+    # 建议同时开启 cudnn benchmark (因为你裁切的 patch_size 是固定的，这能提速约 10%) 
+    torch.backends.cudnn.deterministic = False 
+    torch.backends.cudnn.benchmark = True
     
     loss_fn_vgg = lpips.LPIPS(net='vgg').to(device).eval()
     for param in loss_fn_vgg.parameters(): param.requires_grad = False
@@ -173,7 +182,9 @@ def main():
             
             # ========== 【修改：彻底阻断感知损失计算图】 ========== 
             if epoch > 10: 
-                loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
+                # ========== 【修改：增加梯度安全的截断】 ========== 
+                pred_patch_safe = torch.clamp(pred_patch, 0.0, 1.0) 
+                loss_perceptual = loss_fn_vgg((pred_patch_safe * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
                 loss = loss_l1 + 0.1 * loss_perceptual 
             else: 
                 # 仅用于日志打印，不参与反向传播 

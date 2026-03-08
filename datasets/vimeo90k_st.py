@@ -37,44 +37,40 @@ class Vimeo90K_ST_Dataset(Dataset):
             
         _, H_hr, W_hr = hr_input_frames[0].shape
             
-        # 2. 模拟盲退化：下采样得到 LR 输入 
-        # (💡写论文时请换成你研究一的复杂退化算法，这里为了快速跑通主干，用 bicubic 占位)
-        hr_tensor = torch.stack(hr_input_frames, dim=0)
-        lr_tensor = torch.nn.functional.interpolate(hr_tensor, scale_factor=1/self.scale, mode='bicubic', antialias=True) 
-        
         # 3. 随机决定我们要学“超分”(t=0.0) 还是“插帧”(t=-0.5 / 0.5)
         time_choices = [-0.5, 0.0, 0.5]
         t_q = random.choice(time_choices)
+
+        # 1. 前面读取完毕，合并为全分辨率 Tensor 
+        hr_tensor = torch.stack(hr_input_frames, dim=0) # [3, 3, H, W] 
         
-        # 确定对应的真实 HR 图像作为 GT
-        gt_idx = start_idx + 1 if t_q == -0.5 else (start_idx + 2 if t_q == 0.0 else start_idx + 3)
-        gt_img_path = os.path.join(vid_dir, f'im{gt_idx}.png')
-        gt_img = cv2.imread(gt_img_path)
-        gt_img = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
-        gt_hr_full = torch.from_numpy(gt_img).float().permute(2, 0, 1) / 255.0
-        
-        # 4. 核心省显存逻辑：随机裁剪空间 Patch 
-        y0 = random.randint(0, H_hr - self.patch_size)
-        x0 = random.randint(0, W_hr - self.patch_size)
-        gt_patch = gt_hr_full[:, y0:y0+self.patch_size, x0:x0+self.patch_size]
-        
-        # ========== 【新增：时空数据增强】 ========== 
-        # 水平翻转 
-        if random.random() < 0.5: 
-            lr_tensor = torch.flip(lr_tensor, dims=[2]) # 宽维度 
-            gt_patch = torch.flip(gt_patch, dims=[2]) 
-        
-        # 垂直翻转 
-        if random.random() < 0.5: 
-            lr_tensor = torch.flip(lr_tensor, dims=[1]) # 高维度 
-            gt_patch = torch.flip(gt_patch, dims=[1]) 
+        gt_idx = start_idx + 1 if t_q == -0.5 else (start_idx + 2 if t_q == 0.0 else start_idx + 3) 
+        gt_img_path = os.path.join(vid_dir, f'im{gt_idx}.png') 
+        gt_img = cv2.imread(gt_img_path) 
+        gt_img = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB) 
+        gt_hr_full = torch.from_numpy(gt_img).float().permute(2, 0, 1) / 255.0 # [3, H, W] 
+
+        # ========== 【🔥 修复：将数据增强提前到全图级别】 ========== 
+        if torch.rand(1).item() < 0.5: # 水平翻转 
+            hr_tensor = torch.flip(hr_tensor, dims=[3])  # 4D的宽是 dim 3 
+            gt_hr_full = torch.flip(gt_hr_full, dims=[2]) # 3D的宽是 dim 2 
             
-        # 时序反转 (Reverse) - 让网络学到正向和逆向运动 
-        if random.random() < 0.5: 
-            lr_tensor = torch.flip(lr_tensor, dims=[0]) # 时间维度 
-            # 注意：时序反转时，预测目标的时间戳也要取反 
+        if torch.rand(1).item() < 0.5: # 垂直翻转 
+            hr_tensor = torch.flip(hr_tensor, dims=[2]) 
+            gt_hr_full = torch.flip(gt_hr_full, dims=[1]) 
+            
+        if torch.rand(1).item() < 0.5: # 时序反转 
+            hr_tensor = torch.flip(hr_tensor, dims=[0]) 
             t_q = -t_q 
-        # ========================================== 
+        # ======================================================== 
+        
+        # 2. 增强后再下采样 (此时出来的 LR 已经是翻转同步过的) 
+        lr_tensor = torch.nn.functional.interpolate(hr_tensor, scale_factor=1/self.scale, mode='bicubic', antialias=True) 
+        
+        # 3. 随机裁剪 Patch (改用 torch.randint 防止多进程种子冲突) 
+        y0 = torch.randint(0, H_hr - self.patch_size + 1, (1,)).item() 
+        x0 = torch.randint(0, W_hr - self.patch_size + 1, (1,)).item() 
+        gt_patch = gt_hr_full[:, y0:y0+self.patch_size, x0:x0+self.patch_size] 
         
         # 5. 生成对应的 3D 时空坐标
         y_coords = (torch.arange(H_hr, dtype=torch.float32) / (H_hr - 1)) * 2 - 1
