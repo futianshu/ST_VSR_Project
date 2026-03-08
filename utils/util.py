@@ -15,16 +15,23 @@ def show_param(model ,static_dict, print_param=False):
 
 def load_lora_state_dict(state_dict, model, adapter_name="default"):
     loaded_keys = 0
+    state_keys = list(state_dict.keys()) 
     for n, p in model.named_parameters():
         if adapter_name in n:
             target_name = n.replace(f".{adapter_name}", "")
-            # 智能匹配：在 state_dict 寻找最匹配的 key 
-            match_key = next((k for k in state_dict.keys() if target_name in k), None)
+            
+            # 🔥 剥离我们强加的父级前缀，拿到真正的核心层名 
+            clean_name = target_name.replace("encoder.", "") 
+            
+            match_key = next((k for k in state_keys if clean_name in k), None) 
             if match_key:
                 p.data.copy_(state_dict[match_key])
                 state_dict.pop(match_key)
+                state_keys.remove(match_key) 
                 loaded_keys += 1
-    print(f"✅ 成功智能匹配并加载了 {loaded_keys} 个 LoRA 权重！")
+                
+    print(f"✅ 成功智能匹配并注入了 {loaded_keys} 个 DPAS-SR 先验灵魂！")
+    
     if len(state_dict) > 0:
         print(f"Warning: {len(state_dict)} keys not loaded")
         print(state_dict.keys())

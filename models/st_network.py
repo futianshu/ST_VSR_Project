@@ -20,11 +20,19 @@ class PositionalEncoding3D(nn.Module):
         self.register_buffer('freq_bands', 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs) * math.pi)
 
     def forward(self, coords):
-        pe = []
-        for freq in self.freq_bands:
-            pe.append(torch.sin(coords * freq))
-            pe.append(torch.cos(coords * freq))
-        return torch.cat([coords] + pe, dim=-1) # 63维
+        # 巧妙利用广播：[..., 3, 1] * [10] -> [..., 3, 10]
+        coords_freq = coords.unsqueeze(-1) * self.freq_bands
+        
+        # [..., 3, 10] -> [..., 10, 3]
+        coords_freq = coords_freq.transpose(-1, -2)
+        
+        # 瞬间并行计算所有的 sin 和 cos -> [..., 10, 2, 3]
+        pe = torch.stack([torch.sin(coords_freq), torch.cos(coords_freq)], dim=-2)
+        
+        # 一次性展平最后三个维度 (10 * 2 * 3 = 60)，且排序与你的原 for 循环版 100% 绝对等价！
+        pe = pe.flatten(start_dim=-3)
+        
+        return torch.cat([coords, pe], dim=-1) # 返回 63 维
 
 class ST_VSR_Network(nn.Module):
     def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers"):

@@ -13,6 +13,7 @@ from models.st_network import ST_VSR_Network
 
 from diffusers import StableDiffusion3Pipeline
 from utils.util import load_lora_state_dict
+from safetensors.torch import load_file 
 
 from skimage.metrics import structural_similarity as ssim_func 
 import numpy as np 
@@ -36,9 +37,8 @@ def load_dpas_sr_prior(model, vae_safetensors_path):
     if os.path.exists(vae_safetensors_path):
         print(f"🚀 正在提取研究二的图像生成先验: {vae_safetensors_path}")
         try:
-            dir_name = os.path.dirname(vae_safetensors_path)
-            file_name = os.path.basename(vae_safetensors_path)
-            vae_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(dir_name, weight_name=file_name)
+            # 🔥 弃用易受干扰的 diffusers pipeline 方法，直接读取底层张量字典 
+            vae_lora_state_dict = load_file(vae_safetensors_path) 
             
             load_lora_state_dict(vae_lora_state_dict, model.encoder)
             model.encoder.enable_adapters()
@@ -125,14 +125,18 @@ def main():
     # ==============================================================
     # 🚀 4. 编译优化与 EMA 实例化
     # ==============================================================
+    # 1. 提取最纯净的原始模型引用（剥离 compile 壳） 
+    raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model 
+    
+    # 2. EMA 只绑定纯净网络，彻底和 compile 解耦！ 
+    ema_model = AveragedModel(raw_model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
+    
     try:
         model = torch.compile(model)
         print("✅ 模型已启用 torch.compile 编译优化！")
     except Exception as e:
         print(f"⚠️ torch.compile 启用失败: {e}")
         
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
-    
     # ========== 【核心修复：动态适配 EMA 权重前缀】 ========== 
     if ema_state_dict_cache is not None: 
         # 获取当前 EMA 模型实际需要的前缀 
@@ -168,9 +172,9 @@ def main():
         train_pbar = tqdm(train_dataloader, desc=f"Train Epoch {epoch}/{epochs}")
         
         for step, (lr_seq, coords_xyt, gt_rgb_points) in enumerate(train_pbar):
-            lr_seq = lr_seq.to(device)               
-            coords_xyt = coords_xyt.to(device)       
-            gt_rgb_points = gt_rgb_points.to(device) 
+            lr_seq = lr_seq.to(device, non_blocking=True)               
+            coords_xyt = coords_xyt.to(device, non_blocking=True)       
+            gt_rgb_points = gt_rgb_points.to(device, non_blocking=True) 
             
             optimizer.zero_grad(set_to_none=True)
             
@@ -189,9 +193,9 @@ def main():
             
             # ========== 【修改：彻底阻断感知损失计算图】 ========== 
             if epoch > 10: 
-                # ========== 【修改：增加梯度安全的截断】 ========== 
-                pred_patch_safe = torch.clamp(pred_patch, 0.0, 1.0) 
-                loss_perceptual = loss_fn_vgg((pred_patch_safe * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
+                # ========== 【修复：移除 LPIPS 前的 clamp，释放真实惩罚梯度】 ========== 
+                # 🔥 直接用原生的 pred_patch 
+                loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
                 loss = loss_l1 + 0.1 * loss_perceptual 
             else: 
                 # 仅用于日志打印，不参与反向传播 
@@ -213,7 +217,9 @@ def main():
             optimizer.step()
             
             # ========== 【新增：步进更新 EMA 参数】 ========== 
-            ema_model.update_parameters(model) 
+            # 🔥 更新也只拿纯净的活跃权重进行平滑，绝不打断编译引擎 
+            raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model 
+            ema_model.update_parameters(raw_model) 
             # ================================================= 
             
             # 更新进度条信息 (新增 PSNR 和 当前的学习率 LR)
@@ -239,9 +245,9 @@ def main():
         val_ssim_avg = 0.0  # 新增 SSIM 
         with torch.no_grad():
             for lr_seq, coords_xyt, gt_rgb_points, h_batch, w_batch in tqdm(val_dataloader, desc=f"Val Epoch {epoch}"):
-                lr_seq = lr_seq.to(device)
-                coords_xyt = coords_xyt.to(device)
-                gt_rgb_points = gt_rgb_points.to(device)
+                lr_seq = lr_seq.to(device, non_blocking=True)
+                coords_xyt = coords_xyt.to(device, non_blocking=True)
+                gt_rgb_points = gt_rgb_points.to(device, non_blocking=True)
                 
                 # 传入 chunk_size 进行安全推理 
                 pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000)
