@@ -14,6 +14,10 @@ from models.st_network import ST_VSR_Network
 from diffusers import StableDiffusion3Pipeline
 from utils.util import load_lora_state_dict
 
+from skimage.metrics import structural_similarity as ssim_func 
+import numpy as np 
+import math
+
 class CharbonnierLoss(torch.nn.Module): 
     def __init__(self, eps=1e-6): 
         super(CharbonnierLoss, self).__init__() 
@@ -182,20 +186,39 @@ def main():
         # ==========================================================
         model.eval()
         val_psnr_avg = 0.0
+        val_ssim_avg = 0.0  # 新增 SSIM 
         with torch.no_grad():
             for lr_seq, coords_xyt, gt_rgb_points in tqdm(val_dataloader, desc=f"Val Epoch {epoch}"):
                 lr_seq = lr_seq.to(device)
                 coords_xyt = coords_xyt.to(device)
                 gt_rgb_points = gt_rgb_points.to(device)
                 
-                pred_rgb = model(lr_seq, coords_xyt)
+                # 传入 chunk_size 进行安全推理 
+                pred_rgb = model(lr_seq, coords_xyt, chunk_size=30000)
                 
                 pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0)
                 mse = F.mse_loss(pred_rgb_clamped, gt_rgb_points)
                 val_psnr_avg += 10 * torch.log10(1.0 / (mse + 1e-8))
+                
+                # ========== 【新增：计算 SSIM】 ========== 
+                # SSIM 通常是对每张图单独计算的，这里假设 batch_size 内逐张计算 
+                B, N, _ = pred_rgb_clamped.shape 
+                # Vimeo-90K 验证集一般是 256x448
+                h, w = 256, 448 
+                
+                # 为了简单起见，可以将 batch 中的预测和 GT 还原为 numpy 
+                # 由于这是评估，速度要求不苛刻，转到 CPU 计算标准 SSIM 
+                for b in range(B): 
+                    pred_img = pred_rgb_clamped[b].reshape(3, h, w).permute(1, 2, 0).cpu().numpy() 
+                    gt_img = gt_rgb_points[b].reshape(3, h, w).permute(1, 2, 0).cpu().numpy() 
+                    
+                    batch_ssim = ssim_func(gt_img, pred_img, data_range=1.0, channel_axis=-1) 
+                    val_ssim_avg += batch_ssim / B 
+                # ======================================== 
         
         val_psnr_avg /= len(val_dataloader)
-        print(f"📊 Epoch {epoch} 验证集平均 PSNR: {val_psnr_avg:.2f} dB")
+        val_ssim_avg /= len(val_dataloader) 
+        print(f"📊 Epoch {epoch} 验证集平均 PSNR: {val_psnr_avg:.2f} dB, SSIM: {val_ssim_avg:.4f}")
         
         # ==========================================================
         # 3. 保存逻辑：保存 Best Model 和 Latest Model

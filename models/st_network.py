@@ -77,7 +77,7 @@ class ST_VSR_Network(nn.Module):
             self.inr_mlp[4].weight.uniform_(-c, c) 
         # ===================================================
         
-    def forward(self, lr_seq, coords_xyt):
+    def forward(self, lr_seq, coords_xyt, chunk_size=None):
         B, T, C, H, W = lr_seq.shape
         
         with torch.no_grad():
@@ -103,13 +103,28 @@ class ST_VSR_Network(nn.Module):
         fused_feat = self.feat_proj(fused_feat) 
         # ================================================ 
         
-        spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
-        sampled_feat = F.grid_sample(fused_feat, spatial_coords, align_corners=True)
-        sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous()
-        
-        encoded_coords = self.pe(coords_xyt)
-        
-        inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
-        pred_rgb_points = self.inr_mlp(inr_input) 
-        
-        return pred_rgb_points
+        # ========== 【新增：分块推理机制】 ========== 
+        if chunk_size is None or self.training: 
+            # 训练时一次性计算 
+            spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
+            sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
+            sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
+            encoded_coords = self.pe(coords_xyt) 
+            inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
+            pred_rgb_points = self.inr_mlp(inr_input) 
+            return pred_rgb_points 
+        else: 
+            # 推理评估时分块计算，彻底杜绝 OOM 
+            B, N, _ = coords_xyt.shape 
+            out_list = [] 
+            for i in range(0, N, chunk_size): 
+                coords_chunk = coords_xyt[:, i:i+chunk_size, :] 
+                spatial_coords = coords_chunk[..., :2].unsqueeze(1) 
+                sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
+                sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
+                encoded_coords = self.pe(coords_chunk) 
+                inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
+                out_chunk = self.inr_mlp(inr_input) 
+                out_list.append(out_chunk) 
+            return torch.cat(out_list, dim=1) 
+        # ============================================
