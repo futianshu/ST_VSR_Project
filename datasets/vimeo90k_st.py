@@ -148,4 +148,4 @@ class Vimeo90K_ST_Val_Dataset(Dataset):
         
         gt_rgb_points = gt_hr_full.reshape(3, -1).permute(1, 0) # [N, 3] 
         
-        return lr_tensor, coords_xyt, gt_rgb_points
+        return lr_tensor, coords_xyt, gt_rgb_points, H_hr, W_hr

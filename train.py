@@ -55,73 +55,69 @@ def main():
     model = ST_VSR_Network().to(device)
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
-    # 🚀 PyTorch 2.0+ 编译优化 (免费提速 10%~20%)
-    try:
-        model = torch.compile(model)
-        print("✅ 模型已启用 torch.compile 编译优化！")
-    except Exception as e:
-        print(f"⚠️ torch.compile 启用失败 (可能是 PyTorch 版本过低): {e}")
-    
-    # ========== 【新增：实例化 EMA 模型】 ========== 
-    # decay rate 设为 0.999 是 SR 任务的最优解 
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
-    # ============================================== 
-    
+    # ==============================================================
+    # 🚀 1. 数据集初始化与 Loss 实例化 (保持不变)
+    # ==============================================================
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
-    # 初始化训练集
     train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=128)
     train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True)
-    
-    # ========== 【新增：初始化验证集】 ==========
-    # 验证集不需要 shuffle，batch_size 设小一点（比如2或4），因为评估的是全分辨率大图
     val_dataset = Vimeo90K_ST_Val_Dataset(data_root=vimeo_root, scale=4)
     val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True)
-    # ==========================================
     
     loss_fn_vgg = lpips.LPIPS(net='vgg').to(device).eval()
-    for param in loss_fn_vgg.parameters():
-        param.requires_grad = False
-    
-    # 实例化 Loss 
+    for param in loss_fn_vgg.parameters(): param.requires_grad = False
     charbonnier = CharbonnierLoss().to(device) 
     
     # ==============================================================
-    # 🚀 定义优化器和调度器
+    # 🚀 2. 定义优化器
     # ==============================================================
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
     epochs = 100
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     # ==============================================================
-    # 🚀 断点续训逻辑 (未来如果需要恢复，只需修改 resume_epoch)
+    # 🚀 3. 加载断点权重 (重点：一定要在 Compile 之前加载基础模型权重！)
     # ==============================================================
-    resume_epoch = 0  # 🌟 本次设为 0 从头开始；未来若在第 30 轮断开，改为 30 即可恢复
+    resume_epoch = 0 
     start_epoch = 1
-    best_psnr = 0.0  # 🌟 新增：追踪全局最高 PSNR
+    best_psnr = 0.0  
+    
+    ema_state_dict_cache = None # 缓存 EMA 权重
     
     if resume_epoch > 0:
         checkpoint_path = f"checkpoints/st_vsr_epoch_{resume_epoch}.pth"
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            
-            # 恢复模型权重
+            # 先加载基础模型权重
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             
-            # 恢复优化器和调度器状态（无损续训的关键）
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                
-            # 恢复历史最高 PSNR
-            if 'best_psnr' in checkpoint:
-                best_psnr = checkpoint['best_psnr']
+            if 'optimizer_state_dict' in checkpoint: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'best_psnr' in checkpoint: best_psnr = checkpoint['best_psnr']
+            
+            # 将 EMA 权重取出来暂存，等一会儿实例化后再加载
+            if 'ema_model_state_dict' in checkpoint:
+                ema_state_dict_cache = checkpoint['ema_model_state_dict']
                 
             start_epoch = checkpoint['epoch'] + 1
-            print(f"✅ 成功加载完整断点：{checkpoint_path}，准备从 Epoch {start_epoch} 继续！当前最佳 PSNR: {best_psnr:.2f}")
-        else:
-            print(f"⚠️ 警告：未找到 {checkpoint_path}，将从头开始训练！")
+            print(f"✅ 成功加载完整断点：{checkpoint_path}，当前最佳 PSNR: {best_psnr:.2f}")
+
+    # ==============================================================
+    # 🚀 4. 编译优化与 EMA 实例化
+    # ==============================================================
+    try:
+        model = torch.compile(model)
+        print("✅ 模型已启用 torch.compile 编译优化！")
+    except Exception as e:
+        print(f"⚠️ torch.compile 启用失败: {e}")
+        
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
     
+    # 现在将缓存的 EMA 权重完美加载进去
+    if ema_state_dict_cache is not None:
+        ema_model.load_state_dict(ema_state_dict_cache, strict=False)
+        print("✅ 成功恢复 EMA 平滑权重历史！")
+
     print("🔥 真实世界时空联合训练与验证正式开始！")
     
     for epoch in range(start_epoch, epochs + 1):
@@ -151,12 +147,14 @@ def main():
             pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)
             gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)
             
-            loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean()
-            
-            # ========== 【新增：感知损失预热 (Warm-up)】 ========== 
-            # 前 10 个 Epoch 专注结构恢复，10 轮之后再激活感知损失 
-            weight_lpips = 0.1 if epoch > 10 else 0.0 
-            loss = loss_l1 + weight_lpips * loss_perceptual 
+            # ========== 【修改：彻底阻断感知损失计算图】 ========== 
+            if epoch > 10: 
+                loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
+                loss = loss_l1 + 0.1 * loss_perceptual 
+            else: 
+                # 仅用于日志打印，不参与反向传播 
+                loss_perceptual = torch.tensor(0.0, device=device) 
+                loss = loss_l1 
             # ====================================================
             
             # 使用截断范围计算训练集 PSNR
@@ -198,7 +196,7 @@ def main():
         val_psnr_avg = 0.0
         val_ssim_avg = 0.0  # 新增 SSIM 
         with torch.no_grad():
-            for lr_seq, coords_xyt, gt_rgb_points in tqdm(val_dataloader, desc=f"Val Epoch {epoch}"):
+            for lr_seq, coords_xyt, gt_rgb_points, h_batch, w_batch in tqdm(val_dataloader, desc=f"Val Epoch {epoch}"):
                 lr_seq = lr_seq.to(device)
                 coords_xyt = coords_xyt.to(device)
                 gt_rgb_points = gt_rgb_points.to(device)
@@ -213,8 +211,8 @@ def main():
                 # ========== 【新增：计算 SSIM】 ========== 
                 # SSIM 通常是对每张图单独计算的，这里假设 batch_size 内逐张计算 
                 B, N, _ = pred_rgb_clamped.shape 
-                # Vimeo-90K 验证集一般是 256x448
-                h, w = 256, 448 
+                # 从 batch 中取出实际的高和宽 (转为 int) 
+                h, w = int(h_batch[0]), int(w_batch[0]) 
                 
                 # 为了简单起见，可以将 batch 中的预测和 GT 还原为 numpy 
                 # 由于这是评估，速度要求不苛刻，转到 CPU 计算标准 SSIM 
