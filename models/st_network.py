@@ -90,7 +90,12 @@ class ST_VSR_Network(nn.Module):
             with torch.autocast('cuda', dtype=torch.bfloat16): 
                 latent = self.encoder.encode(lr_seq_input).latent_dist.mode() 
             
-            latent = latent.float() * self.encoder.config.scaling_factor 
+            # 🔥 补充 SD3 特有的 shift_factor 
+            shift_factor = getattr(self.encoder.config, "shift_factor", 0.0609) 
+            scaling_factor = getattr(self.encoder.config, "scaling_factor", 1.5305) 
+            
+            # 严格遵循 SD3 官方提取规范：先减去偏移，再乘缩放 
+            latent = (latent.float() - shift_factor) * scaling_factor 
             latent = latent.reshape(B, T, 16, H // 8, W // 8)
             
             f_prev = latent[:, 0].contiguous()
@@ -114,7 +119,7 @@ class ST_VSR_Network(nn.Module):
             spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
             
             # --- 新增：采样底图 --- 
-            base_rgb = F.grid_sample(lr_curr, spatial_coords, padding_mode='border', align_corners=True) 
+            base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=True) 
             base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
             
             sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
@@ -136,7 +141,7 @@ class ST_VSR_Network(nn.Module):
                 spatial_coords = coords_chunk[..., :2].unsqueeze(1) 
                 
                 # --- 新增：分块采样底图 --- 
-                base_rgb = F.grid_sample(lr_curr, spatial_coords, padding_mode='border', align_corners=True) 
+                base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=True) 
                 base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
                 
                 sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 

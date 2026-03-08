@@ -22,7 +22,8 @@ class Vimeo90K_ST_Dataset(Dataset):
         vid_dir = os.path.join(self.data_root, 'sequences', self.video_paths[idx])
         
         # 1. 巧妙的输入采样：间隔抽取 3 帧作为 LR 输入
-        start_idx = random.randint(1, 3) 
+        # 彻底移除 random，换成多进程安全的 torch.randint 
+        start_idx = int(torch.randint(1, 4, (1,)).item()) 
         input_indices = [start_idx, start_idx + 2, start_idx + 4] # 例: im1, im3, im5
         
         hr_input_frames = []
@@ -30,7 +31,7 @@ class Vimeo90K_ST_Dataset(Dataset):
             img_path = os.path.join(vid_dir, f'im{i}.png')
             img = cv2.imread(img_path)
             if img is None: # 容错：遇到损坏的图片随机换一个
-                return self.__getitem__(random.randint(0, len(self)-1))
+                return self.__getitem__(int(torch.randint(0, len(self)-1, (1,)).item()))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0 # [3, H, W]
             hr_input_frames.append(img)
@@ -39,7 +40,8 @@ class Vimeo90K_ST_Dataset(Dataset):
             
         # 3. 随机决定我们要学“超分”(t=0.0) 还是“插帧”(t=-0.5 / 0.5)
         time_choices = [-0.5, 0.0, 0.5]
-        t_q = random.choice(time_choices)
+        t_idx = int(torch.randint(0, 3, (1,)).item()) 
+        t_q = time_choices[t_idx]
 
         # 1. 前面读取完毕，合并为全分辨率 Tensor 
         hr_tensor = torch.stack(hr_input_frames, dim=0) # [3, 3, H, W] 

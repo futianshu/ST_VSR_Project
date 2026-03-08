@@ -76,7 +76,7 @@ def main():
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
     train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=128)
     # 增加 persistent_workers=True 保持进程存活，Epoch 切换零延迟 
-    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, drop_last=True)
     val_dataset = Vimeo90K_ST_Val_Dataset(data_root=vimeo_root, scale=4)
     val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
     
@@ -138,15 +138,21 @@ def main():
         # 获取当前 EMA 模型实际需要的前缀 
         current_ema_keys = list(ema_model.state_dict().keys()) 
         prefix = "" 
-        if len(current_ema_keys) > 0: 
-            sample_key = current_ema_keys[0] 
-            if "module._orig_mod." in sample_key: 
-                prefix = "module._orig_mod." 
-            elif "module." in sample_key: 
-                prefix = "module." 
+        # 避开 'n_averaged'，找真实的子模块来探测前缀 
+        sample_key = next((k for k in current_ema_keys if "t_aiem" in k or "inr_mlp" in k), "") 
+        if "module._orig_mod." in sample_key: 
+            prefix = "module._orig_mod." 
+        elif "module." in sample_key: 
+            prefix = "module." 
                 
         # 将纯净的 cache 重新拼装上前缀加载进去 
-        restored_ema_dict = {prefix + k: v for k, v in ema_state_dict_cache.items()} 
+        restored_ema_dict = {} 
+        for k, v in ema_state_dict_cache.items(): 
+            if k == 'n_averaged': 
+                restored_ema_dict[k] = v  # 🔥 绝对不加前缀 
+            else: 
+                restored_ema_dict[prefix + k] = v 
+        
         ema_model.load_state_dict(restored_ema_dict, strict=False) 
         print("✅ 成功恢复 EMA 平滑权重历史！") 
     # =======================================================
@@ -158,6 +164,7 @@ def main():
         # 1. 训练阶段 (Train Phase)
         # ==========================================================
         model.train()
+        model.encoder.eval()  # 🔥 必须补上这句，强制 VAE 保持绝对休眠！ 
         train_pbar = tqdm(train_dataloader, desc=f"Train Epoch {epoch}/{epochs}")
         
         for step, (lr_seq, coords_xyt, gt_rgb_points) in enumerate(train_pbar):
@@ -277,6 +284,9 @@ def main():
         ema_save_dict = {} 
         for k, v in ema_model.state_dict().items(): 
             if 'encoder' in k: continue 
+            if k == 'n_averaged': 
+                ema_save_dict[k] = v  # 🔥 绝对保留 
+                continue 
             clean_key = k.replace('module._orig_mod.', '').replace('module.', '') 
             ema_save_dict[clean_key] = v 
         

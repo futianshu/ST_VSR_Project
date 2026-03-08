@@ -14,11 +14,17 @@ def show_param(model ,static_dict, print_param=False):
                 print(param[0])
 
 def load_lora_state_dict(state_dict, model, adapter_name="default"):
+    loaded_keys = 0
     for n, p in model.named_parameters():
         if adapter_name in n:
-            name = "transformer." + n.replace(f".{adapter_name}", "")
-            p.data.copy_(state_dict[name])
-            state_dict.pop(name)
+            target_name = n.replace(f".{adapter_name}", "")
+            # 智能匹配：在 state_dict 寻找最匹配的 key 
+            match_key = next((k for k in state_dict.keys() if target_name in k), None)
+            if match_key:
+                p.data.copy_(state_dict[match_key])
+                state_dict.pop(match_key)
+                loaded_keys += 1
+    print(f"✅ 成功智能匹配并加载了 {loaded_keys} 个 LoRA 权重！")
     if len(state_dict) > 0:
         print(f"Warning: {len(state_dict)} keys not loaded")
         print(state_dict.keys())
