@@ -124,10 +124,23 @@ def main():
         
     ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
     
-    # 现在将缓存的 EMA 权重完美加载进去
-    if ema_state_dict_cache is not None:
-        ema_model.load_state_dict(ema_state_dict_cache, strict=False)
-        print("✅ 成功恢复 EMA 平滑权重历史！")
+    # ========== 【核心修复：动态适配 EMA 权重前缀】 ========== 
+    if ema_state_dict_cache is not None: 
+        # 获取当前 EMA 模型实际需要的前缀 
+        current_ema_keys = list(ema_model.state_dict().keys()) 
+        prefix = "" 
+        if len(current_ema_keys) > 0: 
+            sample_key = current_ema_keys[0] 
+            if "module._orig_mod." in sample_key: 
+                prefix = "module._orig_mod." 
+            elif "module." in sample_key: 
+                prefix = "module." 
+                
+        # 将纯净的 cache 重新拼装上前缀加载进去 
+        restored_ema_dict = {prefix + k: v for k, v in ema_state_dict_cache.items()} 
+        ema_model.load_state_dict(restored_ema_dict, strict=False) 
+        print("✅ 成功恢复 EMA 平滑权重历史！") 
+    # =======================================================
 
     print("🔥 真实世界时空联合训练与验证正式开始！")
     
@@ -245,18 +258,25 @@ def main():
         # ==========================================================
         # 3. 保存逻辑：保存 Best Model 和 Latest Model
         # ==========================================================
-        # 排除无需保存的 encoder 参数
-        model_save_dict = {k: v for k, v in model.state_dict().items() if 'encoder' not in k}
-        ema_save_dict = {k: v for k, v in ema_model.state_dict().items() if 'encoder' not in k} 
+        # 获取原始未编译的模型引用，避免 _orig_mod 污染 
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model 
+        model_save_dict = {k: v for k, v in raw_model.state_dict().items() if 'encoder' not in k} 
         
-        # 打包保存所有关键状态
-        checkpoint_dict = {
-            'epoch': epoch,
-            'model_state_dict': model_save_dict,          # 活跃权重（用于续训） 
-            'ema_model_state_dict': ema_save_dict,        # 🌟 平滑权重（用于推理） 
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_psnr': max(best_psnr, val_psnr_avg) # 保存当前的历史最佳
+        # 剥离 EMA 产生的 module. 和 _orig_mod. 前缀，保存绝对纯净的权重 
+        ema_save_dict = {} 
+        for k, v in ema_model.state_dict().items(): 
+            if 'encoder' in k: continue 
+            clean_key = k.replace('module._orig_mod.', '').replace('module.', '') 
+            ema_save_dict[clean_key] = v 
+        
+        # 打包保存所有关键状态 
+        checkpoint_dict = { 
+            'epoch': epoch, 
+            'model_state_dict': model_save_dict,          # 🌟 绝对纯净的活跃权重 
+            'ema_model_state_dict': ema_save_dict,        # 🌟 绝对纯净的平滑权重 
+            'optimizer_state_dict': optimizer.state_dict(), 
+            'scheduler_state_dict': scheduler.state_dict(), 
+            'best_psnr': max(best_psnr, val_psnr_avg) 
         }
         
         # 策略 A: 保存最新的 Checkpoint (覆盖式，省空间)
