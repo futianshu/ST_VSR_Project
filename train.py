@@ -52,6 +52,22 @@ def load_dpas_sr_prior(model, vae_safetensors_path):
         param.requires_grad = False
     print("❄️ 已冻结 Encoder 参数，32G 显存绝对安全！")
 
+    # ========================================================================= 
+    # 🛠️ V100 终极显存免疫补丁：强制 Linear 层输入连续，彻底解决 cuBLAS 崩溃！ 
+    # ========================================================================= 
+    def make_inputs_contiguous(module, args): 
+        # 拦截输入，如果是 Tensor，强制瞬间重排为连续内存 .contiguous() 
+        return tuple(inp.contiguous() if isinstance(inp, torch.Tensor) else inp for inp in args) 
+
+    patched_layers = 0 
+    for module in model.encoder.modules(): 
+        # 同时拦截原生的 nn.Linear 以及 PEFT 注入的 lora.Linear 
+        if isinstance(module, torch.nn.Linear) or "Linear" in type(module).__name__: 
+            module.register_forward_pre_hook(make_inputs_contiguous) 
+            patched_layers += 1 
+            
+    print(f"🔧 已为 V100 成功注入 {patched_layers} 个内存连续性拦截补丁！")
+
 def main():
     import random 
     
@@ -72,9 +88,9 @@ def main():
     # 🚀 1. 数据集初始化与 Loss 实例化 (保持不变)
     # ==============================================================
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
-    train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=128)
+    train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=256)
     # 增加 persistent_workers=True 保持进程存活，Epoch 切换零延迟 
-    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, drop_last=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, drop_last=True)
     val_dataset = Vimeo90K_ST_Val_Dataset(data_root=vimeo_root, scale=4)
     val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
     
@@ -186,10 +202,14 @@ def main():
             # 将 F.l1_loss 替换为 charbonnier 
             loss_l1 = charbonnier(pred_rgb, gt_rgb_points)
             
-            patch_size = 128  # 必须与 dataset 中的保持一致 
-            B, N, _ = pred_rgb.shape
-            pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)
-            gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, patch_size, patch_size)
+            # 🔥 修复：动态计算当前 Patch 尺寸，彻底告别硬编码！ 
+            B, N, _ = pred_rgb.shape 
+            
+            # 因为 N = H * W，直接开根号就能拿到当前的真实尺寸 (比如 65536 开根号自动算出 256) 
+            current_patch_size = int(math.sqrt(N))  
+            
+            pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size) 
+            gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size)
             
             # ========== 【修改：彻底阻断感知损失计算图】 ========== 
             if epoch > 10: 
