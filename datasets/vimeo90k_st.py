@@ -65,6 +65,10 @@ class Vimeo90K_ST_Dataset(Dataset):
             t_q = -t_q 
         # ======================================================== 
         
+        # 🔥 新增：消除 flip 带来的负步长，强制内存连续，防止 interpolate 崩溃！ 
+        hr_tensor = hr_tensor.contiguous() 
+        gt_hr_full = gt_hr_full.contiguous() 
+        
         # 2. 增强后再下采样 (此时出来的 LR 已经是翻转同步过的) 
         lr_tensor = torch.nn.functional.interpolate(hr_tensor, scale_factor=1/self.scale, mode='bicubic', antialias=True) 
         

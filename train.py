@@ -61,8 +61,6 @@ def main():
     np.random.seed(seed) 
     torch.manual_seed(seed) 
     torch.cuda.manual_seed_all(seed) 
-    torch.backends.cudnn.deterministic = True 
-    torch.backends.cudnn.benchmark = False
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs("checkpoints", exist_ok=True)
@@ -193,8 +191,9 @@ def main():
             
             # ========== 【修改：彻底阻断感知损失计算图】 ========== 
             if epoch > 10: 
-                # ========== 【修复：移除 LPIPS 前的 clamp，释放真实惩罚梯度】 ========== 
-                # 🔥 直接用原生的 pred_patch 
+                # ❌ 务必删掉 pred_patch_safe = torch.clamp(...) 这一行！ 
+                
+                # 🔥 直接用原生的 pred_patch 让惩罚梯度狠狠穿透！ 
                 loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
                 loss = loss_l1 + 0.1 * loss_perceptual 
             else: 

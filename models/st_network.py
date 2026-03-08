@@ -94,9 +94,9 @@ class ST_VSR_Network(nn.Module):
         with torch.no_grad():
             lr_seq_input = lr_seq.reshape(B*T, C, H, W) * 2.0 - 1.0
             
-            # 🔥 取消 for 循环！开启 bfloat16 混合精度并行提取！ 
-            with torch.autocast('cuda', dtype=torch.bfloat16): 
-                latent = self.encoder.encode(lr_seq_input).latent_dist.mode() 
+            # ❌ 必须删掉 with torch.autocast 这行以及它的缩进！ 
+            # 🔥 V100 专属：直接裸跑 FP32，既快又 100% 杜绝数值溢出 
+            latent = self.encoder.encode(lr_seq_input).latent_dist.mode() 
             
             # 🔥 补充 SD3 特有的 shift_factor 
             shift_factor = getattr(self.encoder.config, "shift_factor", 0.0609) 
