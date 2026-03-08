@@ -96,15 +96,25 @@ class Vimeo90K_ST_Val_Dataset(Dataset):
     """ 
     专用于验证集的 Dataloader 
     特点：读取 testlist，不进行随机裁剪，全分辨率评估，固定时间戳预测。 
+    新增：采用“微型验证集”策略，均匀采样 max_val_samples 个视频片段以极速验证。
     """ 
-    def __init__(self, data_root, scale=4): 
+    def __init__(self, data_root, scale=4, max_val_samples=500): 
         self.scale = scale 
         self.data_root = data_root 
         
         # 读取验证集列表 
         list_file = os.path.join(data_root, 'sep_testlist.txt') 
         with open(list_file, 'r') as f: 
-            self.video_paths = [line.strip() for line in f if line.strip()] 
+            all_paths = [line.strip() for line in f if line.strip()] 
+            
+        # ========== 【核心修改：微型验证集均匀采样】 ========== 
+        if len(all_paths) > max_val_samples:
+            # 计算切片步长，确保涵盖各种运动幅度的视频
+            step = len(all_paths) // max_val_samples
+            self.video_paths = all_paths[::step][:max_val_samples]
+        else:
+            self.video_paths = all_paths
+        # ======================================================
 
     def __len__(self): 
         return len(self.video_paths) 
