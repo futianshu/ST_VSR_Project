@@ -17,6 +17,7 @@ from utils.util import load_lora_state_dict
 from skimage.metrics import structural_similarity as ssim_func 
 import numpy as np 
 import math
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn 
 
 class CharbonnierLoss(torch.nn.Module): 
     def __init__(self, eps=1e-6): 
@@ -60,6 +61,11 @@ def main():
         print("✅ 模型已启用 torch.compile 编译优化！")
     except Exception as e:
         print(f"⚠️ torch.compile 启用失败 (可能是 PyTorch 版本过低): {e}")
+    
+    # ========== 【新增：实例化 EMA 模型】 ========== 
+    # decay rate 设为 0.999 是 SR 任务的最优解 
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
+    # ============================================== 
     
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
     # 初始化训练集
@@ -166,6 +172,10 @@ def main():
             
             optimizer.step()
             
+            # ========== 【新增：步进更新 EMA 参数】 ========== 
+            ema_model.update_parameters(model) 
+            # ================================================= 
+            
             # 更新进度条信息 (新增 PSNR 和 当前的学习率 LR)
             current_lr = optimizer.param_groups[0]['lr']
             train_pbar.set_postfix({
@@ -184,7 +194,7 @@ def main():
         # ==========================================================
         # 2. 验证阶段 (Validation Phase)
         # ==========================================================
-        model.eval()
+        ema_model.eval()  # 使用 EMA 评估！ 
         val_psnr_avg = 0.0
         val_ssim_avg = 0.0  # 新增 SSIM 
         with torch.no_grad():
@@ -194,7 +204,7 @@ def main():
                 gt_rgb_points = gt_rgb_points.to(device)
                 
                 # 传入 chunk_size 进行安全推理 
-                pred_rgb = model(lr_seq, coords_xyt, chunk_size=30000)
+                pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000)
                 
                 pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0)
                 mse = F.mse_loss(pred_rgb_clamped, gt_rgb_points)
@@ -208,9 +218,12 @@ def main():
                 
                 # 为了简单起见，可以将 batch 中的预测和 GT 还原为 numpy 
                 # 由于这是评估，速度要求不苛刻，转到 CPU 计算标准 SSIM 
+                # ======================================== 
+                # 修复后的 SSIM 张量还原逻辑 
                 for b in range(B): 
-                    pred_img = pred_rgb_clamped[b].reshape(3, h, w).permute(1, 2, 0).cpu().numpy() 
-                    gt_img = gt_rgb_points[b].reshape(3, h, w).permute(1, 2, 0).cpu().numpy() 
+                    # pred_rgb_clamped[b] 本身是 [h*w, 3] 
+                    pred_img = pred_rgb_clamped[b].reshape(h, w, 3).cpu().numpy() 
+                    gt_img = gt_rgb_points[b].reshape(h, w, 3).cpu().numpy() 
                     
                     batch_ssim = ssim_func(gt_img, pred_img, data_range=1.0, channel_axis=-1) 
                     val_ssim_avg += batch_ssim / B 
@@ -225,14 +238,16 @@ def main():
         # ==========================================================
         # 排除无需保存的 encoder 参数
         model_save_dict = {k: v for k, v in model.state_dict().items() if 'encoder' not in k}
+        ema_save_dict = {k: v for k, v in ema_model.state_dict().items() if 'encoder' not in k} 
         
         # 打包保存所有关键状态
         checkpoint_dict = {
             'epoch': epoch,
-            'model_state_dict': model_save_dict,
+            'model_state_dict': model_save_dict,          # 活跃权重（用于续训） 
+            'ema_model_state_dict': ema_save_dict,        # 🌟 平滑权重（用于推理） 
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'best_psnr': best_psnr # 保存当前的历史最佳
+            'best_psnr': max(best_psnr, val_psnr_avg) # 保存当前的历史最佳
         }
         
         # 策略 A: 保存最新的 Checkpoint (覆盖式，省空间)

@@ -103,16 +103,30 @@ class ST_VSR_Network(nn.Module):
         fused_feat = self.feat_proj(fused_feat) 
         # ================================================ 
         
+        # ========== 【新增：提取中心帧作为残差底图】 ========== 
+        # lr_seq[:, 1] 是当前时刻的 LR 帧 
+        lr_curr = lr_seq[:, 1].contiguous() 
+        # =================================================== 
+
         # ========== 【新增：分块推理机制】 ========== 
         if chunk_size is None or self.training: 
             # 训练时一次性计算 
             spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
+            
+            # --- 新增：采样底图 --- 
+            base_rgb = F.grid_sample(lr_curr, spatial_coords, padding_mode='border', align_corners=True) 
+            base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
+            
             sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
             sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
             encoded_coords = self.pe(coords_xyt) 
             inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
+            
+            # MLP 此时会自动学到预测“残差” 
             pred_rgb_points = self.inr_mlp(inr_input) 
-            return pred_rgb_points 
+            
+            # --- 返回 残差 + 底图 --- 
+            return pred_rgb_points + base_rgb 
         else: 
             # 推理评估时分块计算，彻底杜绝 OOM 
             B, N, _ = coords_xyt.shape 
@@ -120,11 +134,18 @@ class ST_VSR_Network(nn.Module):
             for i in range(0, N, chunk_size): 
                 coords_chunk = coords_xyt[:, i:i+chunk_size, :] 
                 spatial_coords = coords_chunk[..., :2].unsqueeze(1) 
+                
+                # --- 新增：分块采样底图 --- 
+                base_rgb = F.grid_sample(lr_curr, spatial_coords, padding_mode='border', align_corners=True) 
+                base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
+                
                 sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
                 sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
                 encoded_coords = self.pe(coords_chunk) 
                 inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
                 out_chunk = self.inr_mlp(inr_input) 
-                out_list.append(out_chunk) 
+                
+                # --- 分块残差相加 --- 
+                out_list.append(out_chunk + base_rgb) 
             return torch.cat(out_list, dim=1) 
         # ============================================
