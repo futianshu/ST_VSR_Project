@@ -230,7 +230,7 @@ def main():
                 
                 pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0)
                 mse = F.mse_loss(pred_rgb_clamped, gt_rgb_points)
-                val_psnr_avg += 10 * torch.log10(1.0 / (mse + 1e-8))
+                val_psnr_avg += (10 * torch.log10(1.0 / (mse + 1e-8))).item()
                 
                 # ========== 【新增：计算 SSIM】 ========== 
                 # SSIM 通常是对每张图单独计算的，这里假设 batch_size 内逐张计算 
