@@ -89,7 +89,8 @@ def main():
     # ==============================================================
     # 🚀 2. 定义优化器
     # ==============================================================
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
+    # 🔥 加上 fused=True 开启内核融合提速
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, fused=True)
     epochs = 100
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
@@ -129,11 +130,12 @@ def main():
     # 2. EMA 只绑定纯净网络，彻底和 compile 解耦！ 
     ema_model = AveragedModel(raw_model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
     
-    try:
-        model = torch.compile(model)
-        print("✅ 模型已启用 torch.compile 编译优化！")
-    except Exception as e:
-        print(f"⚠️ torch.compile 启用失败: {e}")
+    # ❌ 彻底注释掉或删除这段 compile 代码！
+    # try:
+    #     model = torch.compile(model)
+    #     print("✅ 模型已启用 torch.compile 编译优化！")
+    # except Exception as e:
+    #     print(f"⚠️ torch.compile 启用失败: {e}")
         
     # ========== 【核心修复：动态适配 EMA 权重前缀】 ========== 
     if ema_state_dict_cache is not None: 
@@ -252,27 +254,32 @@ def main():
                 pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000)
                 
                 pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0)
-                mse = F.mse_loss(pred_rgb_clamped, gt_rgb_points)
-                val_psnr_avg += (10 * torch.log10(1.0 / (mse + 1e-8))).item()
                 
-                # ========== 【新增：计算 SSIM】 ========== 
-                # SSIM 通常是对每张图单独计算的，这里假设 batch_size 内逐张计算 
+                # ❌ 删掉原来的这两行全局 MSE 计算 
+                # mse = F.mse_loss(pred_rgb_clamped, gt_rgb_points) 
+                # val_psnr_avg += (10 * torch.log10(1.0 / (mse + 1e-8))).item() 
+                
                 B, N, _ = pred_rgb_clamped.shape 
-                # 从 batch 中取出实际的高和宽 (转为 int) 
                 h, w = int(h_batch[0]), int(w_batch[0]) 
                 
-                # 为了简单起见，可以将 batch 中的预测和 GT 还原为 numpy 
-                # 由于这是评估，速度要求不苛刻，转到 CPU 计算标准 SSIM 
-                # ======================================== 
-                # 修复后的 SSIM 张量还原逻辑 
+                # 🔥 修复：逐图严谨计算指标 
+                batch_psnr = 0.0 
                 for b in range(B): 
-                    # pred_rgb_clamped[b] 本身是 [h*w, 3] 
-                    pred_img = pred_rgb_clamped[b].reshape(h, w, 3).cpu().numpy() 
-                    gt_img = gt_rgb_points[b].reshape(h, w, 3).cpu().numpy() 
+                    pred_img = pred_rgb_clamped[b].reshape(h, w, 3) 
+                    gt_img = gt_rgb_points[b].reshape(h, w, 3) 
                     
-                    batch_ssim = ssim_func(gt_img, pred_img, data_range=1.0, channel_axis=-1) 
+                    # 1. 🌟 单张计算 PSNR 🌟 (都在 GPU 上，非常快) 
+                    mse = F.mse_loss(pred_img, gt_img) 
+                    batch_psnr += (10 * torch.log10(1.0 / (mse + 1e-8))).item() 
+                    
+                    # 2. 单张计算 SSIM 
+                    pred_img_np = pred_img.cpu().numpy() 
+                    gt_img_np = gt_img.cpu().numpy() 
+                    batch_ssim = ssim_func(gt_img_np, pred_img_np, data_range=1.0, channel_axis=-1) 
                     val_ssim_avg += batch_ssim / B 
-                # ======================================== 
+                
+                # 累加这个 Batch 的平均 PSNR 
+                val_psnr_avg += batch_psnr / B 
         
         val_psnr_avg /= len(val_dataloader)
         val_ssim_avg /= len(val_dataloader) 
