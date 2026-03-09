@@ -2,6 +2,9 @@ import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch
+import torch.multiprocessing
+# 🔥 强制多进程数据传输走文件系统，彻底告别共享内存溢出！
+torch.multiprocessing.set_sharing_strategy('file_system')
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader

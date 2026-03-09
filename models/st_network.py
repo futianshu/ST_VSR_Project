@@ -127,10 +127,11 @@ class ST_VSR_Network(nn.Module):
             spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
             
             # --- 新增：采样底图 --- 
-            base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=True) 
+            # ✅ 必须设置为 False，与坐标系、interpolate 完全一致 
+            base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False) 
             base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
             
-            sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
+            sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=False) 
             sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
             encoded_coords = self.pe(coords_xyt) 
             inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
@@ -149,10 +150,11 @@ class ST_VSR_Network(nn.Module):
                 spatial_coords = coords_chunk[..., :2].unsqueeze(1) 
                 
                 # --- 新增：分块采样底图 --- 
-                base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=True) 
+                # ✅ 必须设置为 False，与坐标系、interpolate 完全一致 
+                base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False) 
                 base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
                 
-                sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=True) 
+                sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=False) 
                 sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
                 encoded_coords = self.pe(coords_chunk) 
                 inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 

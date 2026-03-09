@@ -78,8 +78,9 @@ class Vimeo90K_ST_Dataset(Dataset):
         gt_patch = gt_hr_full[:, y0:y0+self.patch_size, x0:x0+self.patch_size] 
         
         # 5. 生成对应的 3D 时空坐标
-        y_coords = (torch.arange(H_hr, dtype=torch.float32) / (H_hr - 1)) * 2 - 1
-        x_coords = (torch.arange(W_hr, dtype=torch.float32) / (W_hr - 1)) * 2 - 1
+        # ✅ 改为像素中心对齐 (加 0.5，除以 H，严格匹配 align_corners=False) 
+        y_coords = (torch.arange(H_hr, dtype=torch.float32) + 0.5) / H_hr * 2.0 - 1.0 
+        x_coords = (torch.arange(W_hr, dtype=torch.float32) + 0.5) / W_hr * 2.0 - 1.0
         
         patch_y_coords = y_coords[y0:y0+self.patch_size]
         patch_x_coords = x_coords[x0:x0+self.patch_size]
@@ -148,8 +149,9 @@ class Vimeo90K_ST_Val_Dataset(Dataset):
         _, H_hr, W_hr = gt_hr_full.shape 
         
         # 4. 全分辨率 3D 时空坐标 (无随机裁剪) 
-        y_coords = (torch.arange(H_hr, dtype=torch.float32) / (H_hr - 1)) * 2 - 1 
-        x_coords = (torch.arange(W_hr, dtype=torch.float32) / (W_hr - 1)) * 2 - 1 
+        # ✅ 改为像素中心对齐 (加 0.5，除以 H，严格匹配 align_corners=False) 
+        y_coords = (torch.arange(H_hr, dtype=torch.float32) + 0.5) / H_hr * 2.0 - 1.0 
+        x_coords = (torch.arange(W_hr, dtype=torch.float32) + 0.5) / W_hr * 2.0 - 1.0 
         
         grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij') 
         
