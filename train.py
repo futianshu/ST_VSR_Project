@@ -266,47 +266,62 @@ def main():
         # ==========================================================
         ema_model.eval()  # 使用 EMA 评估！ 
         val_psnr_avg = 0.0
-        val_ssim_avg = 0.0  # 新增 SSIM 
-        with torch.no_grad():
-            for lr_seq, coords_xyt, gt_rgb_points, h_batch, w_batch in tqdm(val_dataloader, desc=f"Val Epoch {epoch}"):
-                lr_seq = lr_seq.to(device, non_blocking=True)
-                coords_xyt = coords_xyt.to(device, non_blocking=True)
-                gt_rgb_points = gt_rgb_points.to(device, non_blocking=True)
+        val_ssim_avg = 0.0
+        val_lpips_avg = 0.0 # 🌟 新增 LPIPS 
+        with torch.no_grad(): 
+            # 🌟 注意这里加了 enumerate 以获取 step 
+            for step, (lr_seq, coords_xyt, gt_rgb_points, h_batch, w_batch) in enumerate(tqdm(val_dataloader, desc=f"Val Epoch {epoch}")): 
+                lr_seq = lr_seq.to(device, non_blocking=True) 
+                coords_xyt = coords_xyt.to(device, non_blocking=True) 
+                gt_rgb_points = gt_rgb_points.to(device, non_blocking=True) 
                 
-                # 传入 chunk_size 进行安全推理 
-                pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000)
-                
-                pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0)
-                
-                # ❌ 删掉原来的这两行全局 MSE 计算 
-                # mse = F.mse_loss(pred_rgb_clamped, gt_rgb_points) 
-                # val_psnr_avg += (10 * torch.log10(1.0 / (mse + 1e-8))).item() 
+                pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000) 
+                pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0) 
                 
                 B, N, _ = pred_rgb_clamped.shape 
                 h, w = int(h_batch[0]), int(w_batch[0]) 
                 
-                # 🔥 修复：逐图严谨计算指标 
                 batch_psnr = 0.0 
+                batch_lpips = 0.0 # 🌟 新增 
                 for b in range(B): 
                     pred_img = pred_rgb_clamped[b].reshape(h, w, 3) 
                     gt_img = gt_rgb_points[b].reshape(h, w, 3) 
                     
-                    # 1. 🌟 单张计算 PSNR 🌟 (都在 GPU 上，非常快) 
+                    # 1. 计算 PSNR 
                     mse = F.mse_loss(pred_img, gt_img) 
                     batch_psnr += (10 * torch.log10(1.0 / (mse + 1e-8))).item() 
                     
-                    # 2. 单张计算 SSIM 
+                    # 2. 计算 SSIM 
                     pred_img_np = pred_img.cpu().numpy() 
                     gt_img_np = gt_img.cpu().numpy() 
                     batch_ssim = ssim_func(gt_img_np, pred_img_np, data_range=1.0, channel_axis=-1) 
                     val_ssim_avg += batch_ssim / B 
+
+                    # 3. 🌟 计算单张 LPIPS (需调整维度为 [1, 3, H, W] 并映射到 [-1, 1]) 
+                    pred_norm = pred_img.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0 
+                    gt_norm = gt_img.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0 
+                    batch_lpips += loss_fn_vgg(pred_norm, gt_norm).item() 
                 
-                # 累加这个 Batch 的平均 PSNR 
                 val_psnr_avg += batch_psnr / B 
+                val_lpips_avg += batch_lpips / B # 🌟 累加 
+                
+                # 🌟 自动保存验证集第一批次的第一张图（肉眼见证奇迹） 
+                if step == 0: 
+                    import torchvision 
+                    save_dir = "checkpoints/val_images" 
+                    os.makedirs(save_dir, exist_ok=True) 
+                    # 将输入 LR 双三次插值放大，作为对照 
+                    lr_up = F.interpolate(lr_seq[0:1, 1], size=(h, w), mode='bicubic', align_corners=False).squeeze(0).cpu() 
+                    pred_save = pred_img.permute(2, 0, 1).cpu() 
+                    gt_save = gt_img.permute(2, 0, 1).cpu() 
+                    # 拼接：左(Bicubic) | 中(你的预测) | 右(原图 GT) 
+                    comparison = torch.stack([lr_up, pred_save, gt_save], dim=0) 
+                    torchvision.utils.save_image(comparison, f"{save_dir}/epoch_{epoch}_compare.png", nrow=3) 
         
         val_psnr_avg /= len(val_dataloader)
         val_ssim_avg /= len(val_dataloader) 
-        print(f"📊 Epoch {epoch} 验证集平均 PSNR: {val_psnr_avg:.2f} dB, SSIM: {val_ssim_avg:.4f}")
+        val_lpips_avg /= len(val_dataloader) # 🌟 平均 LPIPS 
+        print(f"📊 Epoch {epoch} 验证集平均 PSNR: {val_psnr_avg:.2f} dB, SSIM: {val_ssim_avg:.4f}, LPIPS: {val_lpips_avg:.4f}")
         
         # ==========================================================
         # 3. 保存逻辑：保存 Best Model 和 Latest Model
