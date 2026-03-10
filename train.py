@@ -92,10 +92,10 @@ def main():
     # ==============================================================
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
     train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=256)
-    # 增加 persistent_workers=True 保持进程存活，Epoch 切换零延迟 
-    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, drop_last=True)
+    # 强制每轮 Epoch 结束后重启进程，自动触发系统的垃圾回收，彻底根除泄露！ 
+    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=False, drop_last=True)
     val_dataset = Vimeo90K_ST_Val_Dataset(data_root=vimeo_root, scale=4)
-    val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=False)
     
     # 建议同时开启 cudnn benchmark (因为你裁切的 patch_size 是固定的，这能提速约 10%) 
     torch.backends.cudnn.deterministic = False 
