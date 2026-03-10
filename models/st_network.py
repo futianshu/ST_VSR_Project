@@ -65,28 +65,35 @@ class ST_VSR_Network(nn.Module):
             nn.LeakyReLU(0.2, True), 
             nn.Conv2d(64, 64, 3, 1, 1) 
         ) 
-        # ================================================= 
         
+        # ========== 【🌟 核心修复 1：补充像素级空间锚点】 ========== 
+        # 弥补 VAE 8倍压缩丢失的物理边缘，直接从 LR 提取高频结构
+        self.shallow_cnn = nn.Sequential( 
+            nn.Conv2d(3, 64, 3, 1, 1), 
+            nn.LeakyReLU(0.2, True), 
+            nn.Conv2d(64, 64, 3, 1, 1) 
+        ) 
+        # =========================================================
+
         self.pe = PositionalEncoding3D(num_freqs=10)
         
-        # 维度调整：64(特征) + 63(坐标) = 127 
+        # ========== 【🌟 核心修复 2：解决频率灾难与梯度断崖】 ========== 
+        # 维度依然是: 64(融合特征) + 63(PE坐标) = 127
+        # 彻底废弃 Sine()，改用 LeakyReLU，完美适配 PositionalEncoding！
         self.inr_mlp = nn.Sequential( 
-            nn.Linear(127, 256), Sine(), 
-            nn.Linear(256, 256), Sine(), 
+            nn.Linear(127, 256), 
+            nn.LeakyReLU(0.2, True), 
+            nn.Linear(256, 256), 
+            nn.LeakyReLU(0.2, True), 
             nn.Linear(256, 3) 
         )
         
-        # ========== 【新增：SIREN 专属数学初始化】 ========== 
-        # 第一层：确保输入坐标频率的均匀分布 
-        with torch.no_grad(): 
-            self.inr_mlp[0].weight.uniform_(-1 / 127, 1 / 127)  # 改为 127 
-            c = math.sqrt(6 / 256) / 30.0 
-            self.inr_mlp[2].weight.uniform_(-c, c) 
-            
-            # 🔥 预测残差的层，初始化为极小值，让初始输出几乎为 0，收敛会极其顺滑 
-            self.inr_mlp[4].weight.uniform_(-1e-5, 1e-5) 
+        # 废弃 1e-5 陷阱，使用科学初始化唤醒梯度
+        with torch.no_grad():
+            # 仅将最后一层权重适当缩小，既保证初始残差平稳，又能让梯度完美回传！
+            self.inr_mlp[4].weight.mul_(0.01)
             self.inr_mlp[4].bias.zero_()
-        # ===================================================
+        # =========================================================
         
     def forward(self, lr_seq, coords_xyt, chunk_size=None):
         B, T, C, H, W = lr_seq.shape
@@ -118,49 +125,63 @@ class ST_VSR_Network(nn.Module):
         
         # ========== 【新增：提取中心帧作为残差底图】 ========== 
         # lr_seq[:, 1] 是当前时刻的 LR 帧 
+        # 提取中心帧
         lr_curr = lr_seq[:, 1].contiguous() 
-        # =================================================== 
 
-        # ========== 【新增：分块推理机制】 ========== 
+        # ========== 【🌟 核心修复 3：高低频特征双轨融合】 ==========
+        # 1. 提取 LR 图像的浅层特征 (保留了坚硬清晰的梯子、人物轮廓)
+        lr_shallow_feat = self.shallow_cnn(lr_curr) 
+        # 2. 将微缩的 8x8 VAE 语义特征双线性放大，对齐到 LR 尺寸
+        fused_feat_up = F.interpolate(fused_feat, size=(H, W), mode='bilinear', align_corners=False)
+        # 3. 强强联手：大模型语义先验(VAE) + 物理边缘结构(LR)
+        final_feat = lr_shallow_feat + fused_feat_up
+        # =========================================================
+
         if chunk_size is None or self.training: 
-            # 训练时一次性计算 
             spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
             
-            # --- 新增：采样底图 --- 
-            # ✅ 必须设置为 False，与坐标系、interpolate 完全一致 
             base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False) 
             base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
             
-            sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=False) 
+            # 🌟 修复 4：改为对融合后的高清 final_feat 进行采样
+            sampled_feat = F.grid_sample(final_feat, spatial_coords, padding_mode='border', align_corners=False) 
             sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
-            encoded_coords = self.pe(coords_xyt) 
-            inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
             
-            # MLP 此时会自动学到预测“残差” 
+            # ========== 【🌟 核心修复 5：绝对坐标转局部相对坐标】 ==========
+            device = coords_xyt.device
+            # 极其巧妙的数学运算：将全局 [-1, 1] 转化为 LR 像素内部的相对偏移 [-1, 1]
+            rel_xy = ((coords_xyt[..., :2] + 1.0) * torch.tensor([W / 2.0, H / 2.0], device=device)) % 1.0 * 2.0 - 1.0
+            # 空间用相对坐标，时间 t 保持绝对坐标
+            rel_coords = torch.cat([rel_xy, coords_xyt[..., 2:3]], dim=-1)
+            encoded_coords = self.pe(rel_coords) 
+            # =========================================================
+            
+            inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
             pred_rgb_points = self.inr_mlp(inr_input) 
             
-            # --- 返回 残差 + 底图 --- 
             return pred_rgb_points + base_rgb 
         else: 
-            # 推理评估时分块计算，彻底杜绝 OOM 
             B, N, _ = coords_xyt.shape 
             out_list = [] 
             for i in range(0, N, chunk_size): 
                 coords_chunk = coords_xyt[:, i:i+chunk_size, :] 
                 spatial_coords = coords_chunk[..., :2].unsqueeze(1) 
                 
-                # --- 新增：分块采样底图 --- 
-                # ✅ 必须设置为 False，与坐标系、interpolate 完全一致 
                 base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False) 
                 base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
                 
-                sampled_feat = F.grid_sample(fused_feat, spatial_coords, padding_mode='border', align_corners=False) 
+                # 🌟 改为采样 final_feat
+                sampled_feat = F.grid_sample(final_feat, spatial_coords, padding_mode='border', align_corners=False) 
                 sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
-                encoded_coords = self.pe(coords_chunk) 
+                
+                # 🌟 同步转换块内的相对坐标
+                device = coords_chunk.device
+                rel_xy = ((coords_chunk[..., :2] + 1.0) * torch.tensor([W / 2.0, H / 2.0], device=device)) % 1.0 * 2.0 - 1.0
+                rel_coords = torch.cat([rel_xy, coords_chunk[..., 2:3]], dim=-1)
+                encoded_coords = self.pe(rel_coords) 
+                
                 inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
                 out_chunk = self.inr_mlp(inr_input) 
                 
-                # --- 分块残差相加 --- 
                 out_list.append(out_chunk + base_rgb) 
-            return torch.cat(out_list, dim=1) 
-        # ============================================
+            return torch.cat(out_list, dim=1)
