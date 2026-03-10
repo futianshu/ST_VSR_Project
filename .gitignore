@@ -8,4 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
 checkpoints/*.pth
+checkpoints/val_images/*
