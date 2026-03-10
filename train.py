@@ -114,16 +114,18 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     # ==============================================================
-    # 🚀 3. 加载断点权重 (重点：一定要在 Compile 之前加载基础模型权重！)
+    # 🚀 3. 加载断点权重
     # ==============================================================
-    resume_epoch = 0 
+    resume_epoch = 22  # 只要这个数字大于 0，就会触发读取分支
     start_epoch = 1
     best_psnr = 0.0  
     
     ema_state_dict_cache = None # 缓存 EMA 权重
     
     if resume_epoch > 0:
-        checkpoint_path = f"checkpoints/st_vsr_epoch_{resume_epoch}.pth"
+        # 🌟 核心修改：直接无脑读取 latest 存档，不要用数字拼接去猜！
+        checkpoint_path = "checkpoints/st_vsr_latest.pth" 
+        
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
             # 先加载基础模型权重
@@ -133,12 +135,16 @@ def main():
             if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if 'best_psnr' in checkpoint: best_psnr = checkpoint['best_psnr']
             
-            # 将 EMA 权重取出来暂存，等一会儿实例化后再加载
             if 'ema_model_state_dict' in checkpoint:
                 ema_state_dict_cache = checkpoint['ema_model_state_dict']
                 
+            # 🌟 模型会自动从存档里读出它上次存活在第几个 epoch，并自动 +1
             start_epoch = checkpoint['epoch'] + 1
-            print(f"✅ 成功加载完整断点：{checkpoint_path}，当前最佳 PSNR: {best_psnr:.2f}")
+            print(f"\n✅ 成功加载完整断点：{checkpoint_path}")
+            print(f"🚀 将直接从 Epoch {start_epoch} 开始无缝续训！当前最高 PSNR: {best_psnr:.2f} dB\n")
+        else:
+            # 🚨 加上这句报警！如果文件不存在直接报错退出，决不允许静默从头跑！
+            raise FileNotFoundError(f"❌ 严重错误：找不到断点文件 {checkpoint_path}，请检查路径！")
 
     # ==============================================================
     # 🚀 4. 编译优化与 EMA 实例化
@@ -305,18 +311,20 @@ def main():
                 val_psnr_avg += batch_psnr / B 
                 val_lpips_avg += batch_lpips / B # 🌟 累加 
                 
-                # 🌟 自动保存验证集第一批次的第一张图（肉眼见证奇迹） 
-                if step == 0: 
-                    import torchvision 
-                    save_dir = "checkpoints/val_images" 
-                    os.makedirs(save_dir, exist_ok=True) 
-                    # 将输入 LR 双三次插值放大，作为对照 
-                    lr_up = F.interpolate(lr_seq[0:1, 1], size=(h, w), mode='bicubic', align_corners=False).squeeze(0).cpu() 
-                    pred_save = pred_img.permute(2, 0, 1).cpu() 
-                    gt_save = gt_img.permute(2, 0, 1).cpu() 
-                    # 拼接：左(Bicubic) | 中(你的预测) | 右(原图 GT) 
-                    comparison = torch.stack([lr_up, pred_save, gt_save], dim=0) 
-                    torchvision.utils.save_image(comparison, f"{save_dir}/epoch_{epoch}_compare.png", nrow=3) 
+                # 🌟 自动保存验证集第一批次的第一张图（已修复串台 Bug）
+                if step == 0:
+                    import torchvision
+                    save_dir = "checkpoints/val_images"
+                    os.makedirs(save_dir, exist_ok=True)
+                    # 🌟 强制统一提取 Batch 中的第 0 个样本 (Index 0)！
+                    # 1. 提取第 0 个样本的 LR 并双三次插值放大
+                    lr_up = F.interpolate(lr_seq[0:1, 1], size=(h, w), mode='bicubic', align_corners=False).squeeze(0).cpu()
+                    # 2. 重新从 Tensor 中精确提取第 0 个样本的 Pred 和 GT (避免受 for 循环变量 b 的污染)
+                    pred_save = pred_rgb_clamped[0].reshape(h, w, 3).permute(2, 0, 1).cpu()
+                    gt_save = gt_rgb_points[0].reshape(h, w, 3).permute(2, 0, 1).cpu()
+                    # 拼接：左(Bicubic) | 中(你的预测) | 右(原图 GT)
+                    comparison = torch.stack([lr_up, pred_save, gt_save], dim=0)
+                    torchvision.utils.save_image(comparison, f"{save_dir}/epoch_{epoch}_compare.png", nrow=3)
         
         val_psnr_avg /= len(val_dataloader)
         val_ssim_avg /= len(val_dataloader) 
