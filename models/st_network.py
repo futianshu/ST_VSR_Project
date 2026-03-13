@@ -35,7 +35,7 @@ class PositionalEncoding3D(nn.Module):
         return torch.cat([coords, pe], dim=-1) # 返回 63 维
 
 class ST_VSR_Network(nn.Module):
-    def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers", use_taiem=True, use_shallow_cnn=True):
+    def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers", use_taiem=False, use_shallow_cnn=True):
         super().__init__()
         self.use_taiem = use_taiem
         self.use_shallow_cnn = use_shallow_cnn

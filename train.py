@@ -73,9 +73,9 @@ def load_dpas_sr_prior(model, vae_safetensors_path):
 # 💡 实验名称配置 (每次做新消融实验前，只改这里！)
 # 可选值: "ablation_wo_taiem", "ablation_wo_shallow", "full_model"
 # ==========================================
-# EXP_NAME = "ablation_wo_taiem"  # 当前正在跑：移除 T_AIEM
+EXP_NAME = "ablation_wo_taiem"  # 当前正在跑：移除 T_AIEM
 # EXP_NAME = "ablation_wo_shallow"  # 当前正在跑：移除 shallow
-EXP_NAME = "full_model"  # 当前正在跑：完整模型
+# EXP_NAME = "full_model"  # 当前正在跑：完整模型
 # ==========================================
 
 def main():
