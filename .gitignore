@@ -10,5 +10,4 @@ wheels/
 .venv
 
 checkpoints/
-checkpoints1/
 results/
