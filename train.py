@@ -91,7 +91,17 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(f"checkpoints/{EXP_NAME}", exist_ok=True)
     
-    model = ST_VSR_Network().to(device)
+    # 💡 极其严谨的消融实验路由控制
+    if EXP_NAME == "ablation_wo_taiem":
+        model = ST_VSR_Network(use_taiem=False, use_shallow_cnn=True).to(device)
+        print("🧪 当前运行: 移除 T_AIEM 的消融实验")
+    elif EXP_NAME == "ablation_wo_shallow":
+        model = ST_VSR_Network(use_taiem=True, use_shallow_cnn=False).to(device)
+        print("🧪 当前运行: 移除 Shallow CNN 的消融实验")
+    else:
+        model = ST_VSR_Network(use_taiem=True, use_shallow_cnn=True).to(device)
+        print("🧪 当前运行: 满血完全体")
+
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
     # ==============================================================
