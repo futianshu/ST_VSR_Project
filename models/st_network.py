@@ -35,8 +35,10 @@ class PositionalEncoding3D(nn.Module):
         return torch.cat([coords, pe], dim=-1) # 返回 63 维
 
 class ST_VSR_Network(nn.Module):
-    def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers"):
+    def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers", use_taiem=True, use_shallow_cnn=True):
         super().__init__()
+        self.use_taiem = use_taiem
+        self.use_shallow_cnn = use_shallow_cnn
         
         print("🚀 正在初始化 SD3 VAE 作为生成先验提取器...")
         self.encoder = AutoencoderKL.from_pretrained(sd3_path, subfolder="vae")
@@ -117,24 +119,33 @@ class ST_VSR_Network(nn.Module):
             f_curr = latent[:, 1].contiguous()
             f_next = latent[:, 2].contiguous()
         
-        fused_feat = self.t_aiem(f_prev, f_curr, f_next) 
-        
-        # ========== 【新增：应用局部上下文投影】 ========== 
+        # ========== 【控制 T_AIEM 的消融】 ==========
+        if self.use_taiem:
+            fused_feat = self.t_aiem(f_prev, f_curr, f_next) 
+        else:
+            # 💡 消融 A：不使用时序对齐，直接取中心帧特征
+            fused_feat = f_curr
+            
         fused_feat = self.feat_proj(fused_feat) 
-        # ================================================ 
+        # ============================================
         
         # ========== 【新增：提取中心帧作为残差底图】 ========== 
         # lr_seq[:, 1] 是当前时刻的 LR 帧 
         # 提取中心帧
         lr_curr = lr_seq[:, 1].contiguous() 
 
-        # ========== 【🌟 核心修复 3：高低频特征双轨融合】 ==========
-        # 1. 提取 LR 图像的浅层特征 (保留了坚硬清晰的梯子、人物轮廓)
-        lr_shallow_feat = self.shallow_cnn(lr_curr) 
-        # 2. 将微缩的 8x8 VAE 语义特征双线性放大，对齐到 LR 尺寸
+        # ========== 【控制 Shallow CNN 的消融】 ==========
+        # 将微缩的 8x8 VAE 语义特征双线性放大，对齐到 LR 尺寸
         fused_feat_up = F.interpolate(fused_feat, size=(H, W), mode='bilinear', align_corners=False)
-        # 3. 强强联手：大模型语义先验(VAE) + 物理边缘结构(LR)
-        final_feat = lr_shallow_feat + fused_feat_up
+        
+        if self.use_shallow_cnn:
+            # 提取 LR 图像的浅层特征 (保留了坚硬清晰的梯子、人物轮廓)
+            lr_shallow_feat = self.shallow_cnn(lr_curr) 
+            # 强强联手：大模型语义先验(VAE) + 物理边缘结构(LR)
+            final_feat = lr_shallow_feat + fused_feat_up
+        else:
+            # 💡 消融 B：剥夺物理边缘，纯靠 VAE 先验
+            final_feat = fused_feat_up
         # =========================================================
 
         if chunk_size is None or self.training: 

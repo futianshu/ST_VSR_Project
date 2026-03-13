@@ -69,6 +69,15 @@ def load_dpas_sr_prior(model, vae_safetensors_path):
             
     print(f"🔧 已为 V100 成功注入 {patched_layers} 个内存连续性拦截补丁！")
 
+# ==========================================
+# 💡 实验名称配置 (每次做新消融实验前，只改这里！)
+# 可选值: "ablation_wo_taiem", "ablation_wo_shallow", "full_model"
+# ==========================================
+# EXP_NAME = "ablation_wo_taiem"  # 当前正在跑：移除 T_AIEM
+# EXP_NAME = "ablation_wo_shallow"  # 当前正在跑：移除 shallow
+EXP_NAME = "full_model"  # 当前正在跑：完整模型
+# ==========================================
+
 def main():
     import random 
     
@@ -80,7 +89,7 @@ def main():
     torch.cuda.manual_seed_all(seed) 
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs(f"checkpoints/{EXP_NAME}", exist_ok=True)
     
     model = ST_VSR_Network().to(device)
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
@@ -141,7 +150,7 @@ def main():
     
     if resume_epoch > 0:
         # 🌟 核心修改：直接无脑读取 latest 存档，不要用数字拼接去猜！
-        checkpoint_path = "checkpoints/st_vsr_latest.pth" 
+        checkpoint_path = f"checkpoints/{EXP_NAME}/st_vsr_latest.pth" 
         
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -334,7 +343,7 @@ def main():
                 # 🌟 自动保存验证集第一批次的第一张图（已修复串台 Bug）
                 if step == 0:
                     import torchvision
-                    save_dir = "checkpoints/val_images"
+                    save_dir = f"checkpoints/{EXP_NAME}/val_images"
                     os.makedirs(save_dir, exist_ok=True)
                     # 🌟 强制统一提取 Batch 中的第 0 个样本 (Index 0)！
                     # 1. 提取第 0 个样本的 LR 并双三次插值放大
@@ -379,18 +388,18 @@ def main():
         }
         
         # 策略 A: 保存最新的 Checkpoint (覆盖式，省空间)
-        torch.save(checkpoint_dict, "checkpoints/st_vsr_latest.pth")
+        torch.save(checkpoint_dict, f"checkpoints/{EXP_NAME}/st_vsr_latest.pth")
         
         # 策略 B: 如果当前 PSNR 创新高，保存为 Best Model
         if val_psnr_avg > best_psnr:
             best_psnr = val_psnr_avg
             checkpoint_dict['best_psnr'] = best_psnr # 更新 best_psnr
-            torch.save(checkpoint_dict, "checkpoints/st_vsr_best.pth")
+            torch.save(checkpoint_dict, f"checkpoints/{EXP_NAME}/st_vsr_best.pth")
             print(f"🎉 恭喜！Epoch {epoch} 刷新最高记录！Best PSNR: {best_psnr:.2f} dB")
         
         # 策略 C: 每 10 个 Epoch 留一个存档
         if epoch % 10 == 0:
-            torch.save(checkpoint_dict, f"checkpoints/st_vsr_epoch_{epoch}.pth")
+            torch.save(checkpoint_dict, f"checkpoints/{EXP_NAME}/st_vsr_epoch_{epoch}.pth")
 
 if __name__ == '__main__':
     main()
