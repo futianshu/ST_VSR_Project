@@ -2,9 +2,7 @@ import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch
-import torch.multiprocessing
-# 🔥 强制多进程数据传输走文件系统，彻底告别共享内存溢出！
-torch.multiprocessing.set_sharing_strategy('file_system')
+
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -92,10 +90,29 @@ def main():
     # ==============================================================
     vimeo_root = "/home/ubuntu/data/OpenDataLab___Vimeo90K/raw/vimeo_septuplet"
     train_dataset = Vimeo90K_ST_Dataset(data_root=vimeo_root, scale=4, patch_size=256)
-    # 强制每轮 Epoch 结束后重启进程，自动触发系统的垃圾回收，彻底根除泄露！ 
-    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=False, drop_last=True)
     val_dataset = Vimeo90K_ST_Val_Dataset(data_root=vimeo_root, scale=4)
-    val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=False)
+    # 🔥 终极防泄漏/防卡死配置： 
+    # 1. 降低 num_workers 到 4（防止瞬时并发撑爆内存） 
+    # 2. pin_memory=False （🌟 极其关键！阻断后台线程占用，彻底根除底层 SHM 内存泄漏） 
+    # 3. persistent_workers=True （保持通道常开，拒绝每轮反复创建销毁引发的碎片） 
+    train_dataloader = DataLoader( 
+        train_dataset, 
+        batch_size=32, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=False, 
+        persistent_workers=True, 
+        drop_last=True 
+    ) 
+    
+    val_dataloader = DataLoader( 
+        val_dataset, 
+        batch_size=2, 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=False, 
+        persistent_workers=True 
+    )
     
     # 建议同时开启 cudnn benchmark (因为你裁切的 patch_size 是固定的，这能提速约 10%) 
     torch.backends.cudnn.deterministic = False 
@@ -261,6 +278,9 @@ def main():
                 'PSNR': f"{psnr.item():.2f}",
                 'LR': f"{current_lr:.2e}"
             })
+            
+            # 🔥 强制垃圾回收
+            del lr_seq, coords_xyt, gt_rgb_points, pred_rgb
             
         # ==============================================================
         # 🚀 Epoch 结束后：调度器步进 & 完整 Checkpoint 保存
