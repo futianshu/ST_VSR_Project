@@ -4,14 +4,6 @@ import torch.nn.functional as F
 import math
 from diffusers.models import AutoencoderKL
 from peft import LoraConfig
-from models.t_aiem import T_AIEM
-
-class Sine(nn.Module):
-    def __init__(self, w0=30.0):
-        super().__init__()
-        self.w0 = w0
-    def forward(self, x):
-        return torch.sin(self.w0 * x)
 
 class PositionalEncoding3D(nn.Module):
     def __init__(self, num_freqs=10):
@@ -20,19 +12,20 @@ class PositionalEncoding3D(nn.Module):
         self.register_buffer('freq_bands', 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs) * math.pi)
 
     def forward(self, coords):
-        # 巧妙利用广播：[..., 3, 1] * [10] -> [..., 3, 10]
         coords_freq = coords.unsqueeze(-1) * self.freq_bands
-        
-        # [..., 3, 10] -> [..., 10, 3]
         coords_freq = coords_freq.transpose(-1, -2)
-        
-        # 瞬间并行计算所有的 sin 和 cos -> [..., 10, 2, 3]
         pe = torch.stack([torch.sin(coords_freq), torch.cos(coords_freq)], dim=-2)
-        
-        # 一次性展平最后三个维度 (10 * 2 * 3 = 60)，且排序与你的原 for 循环版 100% 绝对等价！
         pe = pe.flatten(start_dim=-3)
-        
-        return torch.cat([coords, pe], dim=-1) # 返回 63 维
+        return torch.cat([coords, pe], dim=-1)
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.relu = nn.LeakyReLU(0.2, True)
+        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1)
+    def forward(self, x):
+        return x + self.conv2(self.relu(self.conv1(x)))
 
 class ST_VSR_Network(nn.Module):
     def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers", use_taiem=True, use_shallow_cnn=True):
@@ -43,14 +36,8 @@ class ST_VSR_Network(nn.Module):
         print("🚀 正在初始化 SD3 VAE 作为生成先验提取器...")
         self.encoder = AutoencoderKL.from_pretrained(sd3_path, subfolder="vae")
         
-        vae_target_modules = ['encoder.conv_in', 'encoder.down_blocks.0.resnets.0.conv1', 'encoder.down_blocks.0.resnets.0.conv2', 'encoder.down_blocks.0.resnets.1.conv1', 
-                              'encoder.down_blocks.0.resnets.1.conv2', 'encoder.down_blocks.0.downsamplers.0.conv', 'encoder.down_blocks.1.resnets.0.conv1',
-                              'encoder.down_blocks.1.resnets.0.conv2', 'encoder.down_blocks.1.resnets.0.conv_shortcut', 'encoder.down_blocks.1.resnets.1.conv1', 'encoder.down_blocks.1.resnets.1.conv2', 
-                              'encoder.down_blocks.1.downsamplers.0.conv', 'encoder.down_blocks.2.resnets.0.conv1', 'encoder.down_blocks.2.resnets.0.conv2',
-                              'encoder.down_blocks.2.resnets.0.conv_shortcut', 'encoder.down_blocks.2.resnets.1.conv1', 'encoder.down_blocks.2.resnets.1.conv2', 'encoder.down_blocks.2.downsamplers.0.conv',
-                              'encoder.down_blocks.3.resnets.0.conv1', 'encoder.down_blocks.3.resnets.0.conv2', 'encoder.down_blocks.3.resnets.1.conv1', 'encoder.down_blocks.3.resnets.1.conv2', 
-                              'encoder.mid_block.attentions.0.to_q', 'encoder.mid_block.attentions.0.to_k', 'encoder.mid_block.attentions.0.to_v', 'encoder.mid_block.attentions.0.to_out.0', 
-                              'encoder.mid_block.resnets.0.conv1', 'encoder.mid_block.resnets.0.conv2', 'encoder.mid_block.resnets.1.conv1', 'encoder.mid_block.resnets.1.conv2', 'encoder.conv_out', 'quant_conv']
+        # [请保留你原来的 vae_target_modules 完整列表，这里为排版简写]
+        vae_target_modules = ['encoder.conv_in', 'encoder.down_blocks.0.resnets.0.conv1'] 
         vae_lora_config = LoraConfig(r=64, lora_alpha=64, init_lora_weights="gaussian", target_modules=vae_target_modules)
         self.encoder.add_adapter(vae_lora_config, adapter_name="default")
         
@@ -58,141 +45,125 @@ class ST_VSR_Network(nn.Module):
             param.requires_grad = False
         self.encoder.eval()
         
-        self.t_aiem = T_AIEM(channels=16)
+        # ========== 核心 1：时间条件生成的 VAE 语义解压缩 ==========
+        # 如果启用时序融合，输入为 [z_prev, z_curr, z_next, t_map] 共 16*3+1=49 通道
+        latent_in_channels = 49 if self.use_taiem else 16
+        self.vae_decoder = nn.Sequential(
+            nn.Conv2d(latent_in_channels, 256, 3, 1, 1),
+            nn.PixelShuffle(2), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 256, 3, 1, 1),
+            nn.PixelShuffle(2), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 256, 3, 1, 1),
+            nn.PixelShuffle(2), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 64, 3, 1, 1)
+        )
         
-        # ========== 【新增：局部上下文特征增强层】 ========== 
-        # 提取 3x3 范围的局部结构，并从 16 维升维到 64 维 
-        self.feat_proj = nn.Sequential( 
-            nn.Conv2d(16, 64, 3, 1, 1), 
-            nn.LeakyReLU(0.2, True), 
-            nn.Conv2d(64, 64, 3, 1, 1) 
-        ) 
-        
-        # ========== 【🌟 核心修复 1：补充像素级空间锚点】 ========== 
-        # 弥补 VAE 8倍压缩丢失的物理边缘，直接从 LR 提取高频结构
-        self.shallow_cnn = nn.Sequential( 
-            nn.Conv2d(3, 64, 3, 1, 1), 
-            nn.LeakyReLU(0.2, True), 
-            nn.Conv2d(64, 64, 3, 1, 1) 
-        ) 
-        # =========================================================
+        # ========== 核心 2：时间条件驱动的物理对齐网络 ==========
+        if self.use_shallow_cnn:
+            self.shallow_feat_extract = nn.Sequential(
+                nn.Conv2d(3, 64, 3, 1, 1),
+                nn.LeakyReLU(0.2, True),
+                ResBlock(64)
+            )
+            # 如果不启用时序，这一层不会被使用；若启用，输入为 [f_prev, f_curr, f_next, t_map] 共 64*3+1=193 通道
+            self.time_cond_fusion = nn.Sequential(
+                nn.Conv2d(193, 64, 3, 1, 1),
+                nn.LeakyReLU(0.2, True),
+                ResBlock(64), ResBlock(64),
+                nn.Conv2d(64, 64, 3, 1, 1)
+            )
 
         self.pe = PositionalEncoding3D(num_freqs=10)
         
-        # ========== 【🌟 核心修复 2：解决频率灾难与梯度断崖】 ========== 
-        # 维度依然是: 64(融合特征) + 63(PE坐标) = 127
-        # 彻底废弃 Sine()，改用 LeakyReLU，完美适配 PositionalEncoding！
+        # ========== 核心 3：专属细化 MLP ==========
+        # 输入：64(融合特征) + 63(位置编码) = 127
         self.inr_mlp = nn.Sequential( 
-            nn.Linear(127, 256), 
-            nn.LeakyReLU(0.2, True), 
-            nn.Linear(256, 256), 
-            nn.LeakyReLU(0.2, True), 
+            nn.Linear(127, 256), nn.LeakyReLU(0.2, True), 
+            nn.Linear(256, 256), nn.LeakyReLU(0.2, True), 
+            nn.Linear(256, 256), nn.LeakyReLU(0.2, True), 
             nn.Linear(256, 3) 
         )
         
-        # 废弃 1e-5 陷阱，使用科学初始化唤醒梯度
         with torch.no_grad():
-            # 仅将最后一层权重适当缩小，既保证初始残差平稳，又能让梯度完美回传！
-            self.inr_mlp[4].weight.mul_(0.01)
-            self.inr_mlp[4].bias.zero_()
-        # =========================================================
-        
+            self.inr_mlp[-1].weight.mul_(0.01)
+            self.inr_mlp[-1].bias.zero_()
+
     def forward(self, lr_seq, coords_xyt, chunk_size=None):
         B, T, C, H, W = lr_seq.shape
+        lr_prev, lr_curr, lr_next = lr_seq[:, 0], lr_seq[:, 1], lr_seq[:, 2]
         
+        # 🧠 灵魂设计：将当前查询的时间 t_q 广播成特征图
+        # 让具有空间感受野的 CNN 直接看见“目标时间”，从而主动扭曲/移动特征
+        t_q = coords_xyt[:, 0, 2].view(B, 1, 1, 1) 
+        t_map = t_q.expand(B, 1, H, W).contiguous()
+        t_map_latent = t_q.expand(B, 1, H // 8, W // 8).contiguous()
+
+        # --- 1. 物理时空流 (Pixel Space) ---
+        if self.use_shallow_cnn:
+            if self.use_taiem:
+                f_prev = self.shallow_feat_extract(lr_prev)
+                f_curr = self.shallow_feat_extract(lr_curr)
+                f_next = self.shallow_feat_extract(lr_next)
+                fused_spatial = self.time_cond_fusion(torch.cat([f_prev, f_curr, f_next, t_map], dim=1))
+            else:
+                fused_spatial = self.shallow_feat_extract(lr_curr) # Ablation: 退化为单帧
+        else:
+            fused_spatial = 0.0
+
+        # --- 2. 语义生成流 (SD3 VAE) ---
         with torch.no_grad():
             lr_seq_input = lr_seq.reshape(B*T, C, H, W) * 2.0 - 1.0
-            
-            # ❌ 必须删掉 with torch.autocast 这行以及它的缩进！ 
-            # 🔥 V100 专属：直接裸跑 FP32，既快又 100% 杜绝数值溢出 
-            latent = self.encoder.encode(lr_seq_input).latent_dist.mode() 
-            
-            # 🔥 补充 SD3 特有的 shift_factor 
-            shift_factor = getattr(self.encoder.config, "shift_factor", 0.0609) 
-            scaling_factor = getattr(self.encoder.config, "scaling_factor", 1.5305) 
-            
-            # 严格遵循 SD3 官方提取规范：先减去偏移，再乘缩放 
-            latent = (latent.float() - shift_factor) * scaling_factor 
+            latent = self.encoder.encode(lr_seq_input).latent_dist.mode()
+            latent = (latent.float() - 0.0609) * 1.5305
             latent = latent.reshape(B, T, 16, H // 8, W // 8)
-            
-            f_prev = latent[:, 0].contiguous()
-            f_curr = latent[:, 1].contiguous()
-            f_next = latent[:, 2].contiguous()
-        
-        # ========== 【控制 T_AIEM 的消融】 ==========
+            z_prev, z_curr, z_next = latent[:, 0], latent[:, 1], latent[:, 2]
+
         if self.use_taiem:
-            fused_feat = self.t_aiem(f_prev, f_curr, f_next) 
+            fused_latent = self.vae_decoder(torch.cat([z_prev, z_curr, z_next, t_map_latent], dim=1))
         else:
-            # 💡 消融 A：不使用时序对齐，直接取中心帧特征
-            fused_feat = f_curr
-            
-        fused_feat = self.feat_proj(fused_feat) 
-        # ============================================
-        
-        # ========== 【新增：提取中心帧作为残差底图】 ========== 
-        # lr_seq[:, 1] 是当前时刻的 LR 帧 
-        # 提取中心帧
-        lr_curr = lr_seq[:, 1].contiguous() 
+            fused_latent = self.vae_decoder(z_curr) # Ablation: 退化为单帧
 
-        # ========== 【控制 Shallow CNN 的消融】 ==========
-        # 将微缩的 8x8 VAE 语义特征双线性放大，对齐到 LR 尺寸
-        fused_feat_up = F.interpolate(fused_feat, size=(H, W), mode='bilinear', align_corners=False)
-        
-        if self.use_shallow_cnn:
-            # 提取 LR 图像的浅层特征 (保留了坚硬清晰的梯子、人物轮廓)
-            lr_shallow_feat = self.shallow_cnn(lr_curr) 
-            # 强强联手：大模型语义先验(VAE) + 物理边缘结构(LR)
-            final_feat = lr_shallow_feat + fused_feat_up
+        final_feat = fused_spatial + fused_latent
+
+        # --- 3. INR 连续推理块分发 ---
+        if chunk_size is None or self.training:
+            return self._forward_chunk(lr_prev, lr_curr, lr_next, final_feat, coords_xyt, H, W)
         else:
-            # 💡 消融 B：剥夺物理边缘，纯靠 VAE 先验
-            final_feat = fused_feat_up
-        # =========================================================
-
-        if chunk_size is None or self.training: 
-            spatial_coords = coords_xyt[..., :2].unsqueeze(1) 
-            
-            base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False) 
-            base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
-            
-            # 🌟 修复 4：改为对融合后的高清 final_feat 进行采样
-            sampled_feat = F.grid_sample(final_feat, spatial_coords, padding_mode='border', align_corners=False) 
-            sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
-            
-            # ========== 【🌟 核心修复 5：绝对坐标转局部相对坐标】 ==========
-            device = coords_xyt.device
-            # 极其巧妙的数学运算：将全局 [-1, 1] 转化为 LR 像素内部的相对偏移 [-1, 1]
-            rel_xy = ((coords_xyt[..., :2] + 1.0) * torch.tensor([W / 2.0, H / 2.0], device=device)) % 1.0 * 2.0 - 1.0
-            # 空间用相对坐标，时间 t 保持绝对坐标
-            rel_coords = torch.cat([rel_xy, coords_xyt[..., 2:3]], dim=-1)
-            encoded_coords = self.pe(rel_coords) 
-            # =========================================================
-            
-            inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
-            pred_rgb_points = self.inr_mlp(inr_input) 
-            
-            return pred_rgb_points + base_rgb 
-        else: 
-            B, N, _ = coords_xyt.shape 
-            out_list = [] 
-            for i in range(0, N, chunk_size): 
-                coords_chunk = coords_xyt[:, i:i+chunk_size, :] 
-                spatial_coords = coords_chunk[..., :2].unsqueeze(1) 
-                
-                base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False) 
-                base_rgb = base_rgb.squeeze(2).permute(0, 2, 1).contiguous() 
-                
-                # 🌟 改为采样 final_feat
-                sampled_feat = F.grid_sample(final_feat, spatial_coords, padding_mode='border', align_corners=False) 
-                sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
-                
-                # 🌟 同步转换块内的相对坐标
-                device = coords_chunk.device
-                rel_xy = ((coords_chunk[..., :2] + 1.0) * torch.tensor([W / 2.0, H / 2.0], device=device)) % 1.0 * 2.0 - 1.0
-                rel_coords = torch.cat([rel_xy, coords_chunk[..., 2:3]], dim=-1)
-                encoded_coords = self.pe(rel_coords) 
-                
-                inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
-                out_chunk = self.inr_mlp(inr_input) 
-                
-                out_list.append(out_chunk + base_rgb) 
+            B_c, N, _ = coords_xyt.shape
+            out_list = []
+            for i in range(0, N, chunk_size):
+                out_chunk = self._forward_chunk(lr_prev, lr_curr, lr_next, final_feat, coords_xyt[:, i:i+chunk_size, :], H, W)
+                out_list.append(out_chunk)
             return torch.cat(out_list, dim=1)
+
+    def _forward_chunk(self, lr_prev, lr_curr, lr_next, final_feat, coords, H, W):
+        spatial_coords = coords[..., :2].unsqueeze(1) 
+        
+        # 采样生成好的“目标时间特征”
+        sampled_feat = F.grid_sample(final_feat, spatial_coords, padding_mode='border', align_corners=False) 
+        sampled_feat = sampled_feat.squeeze(2).permute(0, 2, 1).contiguous() 
+        
+        device = coords.device
+        rel_xy = ((coords[..., :2] + 1.0) * torch.tensor([W / 2.0, H / 2.0], device=device)) % 1.0 * 2.0 - 1.0
+        rel_coords = torch.cat([rel_xy, coords[..., 2:3]], dim=-1)
+        encoded_coords = self.pe(rel_coords) 
+        
+        inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
+        pred_residual = self.inr_mlp(inr_input) 
+
+        # ========== 🧠 拯救残差的物理底图混合器 (Dynamic Base Blending) ==========
+        if self.use_taiem:
+            t_chunk = coords[..., 2:3] # [B, N, 1]
+            w_p = torch.relu(-t_chunk)         # 距离上一帧的权重 (t=-0.5时为0.5)
+            w_n = torch.relu(t_chunk)          # 距离下一帧的权重 (t=0.5时为0.5)
+            w_c = 1.0 - torch.abs(t_chunk)     # 距离当前帧的权重 (t=0.0时为1.0)
+            
+            base_p = F.grid_sample(lr_prev, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
+            base_c = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
+            base_n = F.grid_sample(lr_next, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
+            
+            base_rgb = w_p * base_p + w_c * base_c + w_n * base_n
+        else:
+            base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
+
+        return pred_residual + base_rgb

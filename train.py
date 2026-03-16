@@ -3,6 +3,11 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import torch
 
+# ========== 【🌟 终极修复：将多进程共享内存转移到文件系统，彻底告别 shm 爆满】 ==========
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+# ======================================================================================
+
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -73,8 +78,8 @@ def load_dpas_sr_prior(model, vae_safetensors_path):
 # 💡 实验名称配置 (每次做新消融实验前，只改这里！)
 # 可选值: "ablation_wo_taiem", "ablation_wo_shallow", "full_model"
 # ==========================================
-EXP_NAME = "ablation_wo_taiem"  # 当前正在跑：移除 T_AIEM
-# EXP_NAME = "ablation_wo_shallow"  # 当前正在跑：移除 shallow
+# EXP_NAME = "ablation_wo_taiem"  # 当前正在跑：移除 T_AIEM
+EXP_NAME = "ablation_wo_shallow"  # 当前正在跑：移除 shallow
 # EXP_NAME = "full_model"  # 当前正在跑：完整模型
 # ==========================================
 
@@ -152,7 +157,7 @@ def main():
     # ==============================================================
     # 🚀 3. 加载断点权重
     # ==============================================================
-    resume_epoch = 0  # 只要这个数字大于 0，就会触发读取分支
+    resume_epoch = 50  # 只要这个数字大于 0，就会触发读取分支
     start_epoch = 1
     best_psnr = 0.0  
     
@@ -256,17 +261,11 @@ def main():
             pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size) 
             gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size)
             
-            # ========== 【修改：彻底阻断感知损失计算图】 ========== 
-            if epoch > 10: 
-                # ❌ 务必删掉 pred_patch_safe = torch.clamp(...) 这一行！ 
-                
-                # 🔥 直接用原生的 pred_patch 让惩罚梯度狠狠穿透！ 
-                loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
-                loss = loss_l1 + 0.1 * loss_perceptual 
-            else: 
-                # 仅用于日志打印，不参与反向传播 
-                loss_perceptual = torch.tensor(0.0, device=device) 
-                loss = loss_l1 
+            # ========== 【修改：提前引入感知损失】 ========== 
+            # 强烈建议从一开始就用 LPIPS 指导高频纹理的生成，不用等 epoch 10
+            # 使用较小的权重 (如 0.05 或 0.1) 以确保不破坏 Charbonnier 的主导色彩结构
+            loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
+            loss = loss_l1 + 0.1 * loss_perceptual 
             # ====================================================
             
             # 使用截断范围计算训练集 PSNR
