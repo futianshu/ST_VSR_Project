@@ -106,6 +106,13 @@ def main():
         model = ST_VSR_Network(use_time_cond=True, use_shallow_cnn=True).to(device)
         print("🧪 当前运行: 满血完全体 (双流 + 时间靶向)")
 
+    # 只编译我们自己写的无副作用的子模块
+    model.inr_mlp = torch.compile(model.inr_mlp)
+    if model.use_shallow_cnn:
+        model.shallow_feat_extract = torch.compile(model.shallow_feat_extract)
+        if model.use_time_cond:
+            model.time_cond_fusion = torch.compile(model.time_cond_fusion)
+
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
     # ==============================================================
@@ -122,10 +129,11 @@ def main():
         train_dataset, 
         batch_size=32, 
         shuffle=True, 
-        num_workers=4, 
-        pin_memory=False, 
+        num_workers=4,        
+        pin_memory=True,      # 🚀 开启锁页内存，极大加速 CPU 数据送到 GPU 的带宽
+        prefetch_factor=2,    # 🚀 提前预取 2 个 Batch
         persistent_workers=True, 
-        drop_last=True 
+        drop_last=True
     ) 
     
     val_dataloader = DataLoader( 
@@ -153,10 +161,13 @@ def main():
     epochs = 100
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
+    # 🚀 级别 2 提速：初始化 AMP 的 GradScaler (加在这里！)
+    scaler = torch.cuda.amp.GradScaler() # 如果你是 3090/A100/H100，可以直接无脑用 bfloat16 连 scaler 都省了，但如果是 V100 老老实实用 Scaler
+    
     # ==============================================================
     # 🚀 3. 加载断点权重
     # ==============================================================
-    resume_epoch = 50  # 只要这个数字大于 0，就会触发读取分支
+    resume_epoch = 0  # 只要这个数字大于 0，就会触发读取分支
     start_epoch = 1
     best_psnr = 0.0  
     
@@ -243,43 +254,39 @@ def main():
             
             optimizer.zero_grad(set_to_none=True)
             
-            # ==============================================================
-            # 纯 FP32 正向传播
-            # ==============================================================
-            pred_rgb = model(lr_seq, coords_xyt) 
+            # 🚀 开启自动混合精度上下文 (替换了原来的“纯 FP32 正向传播”)
+            with torch.cuda.amp.autocast():
+                pred_rgb = model(lr_seq, coords_xyt) 
+                
+                # 计算 L1 损失
+                loss_l1 = charbonnier(pred_rgb, gt_rgb_points)
+                
+                # 动态计算 Patch 尺寸
+                B, N, _ = pred_rgb.shape 
+                current_patch_size = int(math.sqrt(N))  
+                pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size) 
+                gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size)
+                
+                # 计算感知损失
+                loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
+                loss = loss_l1 + 0.1 * loss_perceptual 
             
-            # 将 F.l1_loss 替换为 charbonnier 
-            loss_l1 = charbonnier(pred_rgb, gt_rgb_points)
-            
-            # 🔥 修复：动态计算当前 Patch 尺寸，彻底告别硬编码！ 
-            B, N, _ = pred_rgb.shape 
-            
-            # 因为 N = H * W，直接开根号就能拿到当前的真实尺寸 (比如 65536 开根号自动算出 256) 
-            current_patch_size = int(math.sqrt(N))  
-            
-            pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size) 
-            gt_patch = gt_rgb_points.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size)
-            
-            # ========== 【修改：提前引入感知损失】 ========== 
-            # 强烈建议从一开始就用 LPIPS 指导高频纹理的生成，不用等 epoch 10
-            # 使用较小的权重 (如 0.05 或 0.1) 以确保不破坏 Charbonnier 的主导色彩结构
-            loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
-            loss = loss_l1 + 0.1 * loss_perceptual 
-            # ====================================================
-            
-            # 使用截断范围计算训练集 PSNR
+            # (PSNR 计算保持在 FP32 且不需要梯度)
             with torch.no_grad():
-                pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0)
+                pred_rgb_clamped = torch.clamp(pred_rgb.float(), 0.0, 1.0) # 强制转回 float32 算 PSNR 避免精度溢出
                 mse_loss = F.mse_loss(pred_rgb_clamped, gt_rgb_points)
                 psnr = 10 * torch.log10(1.0 / (mse_loss + 1e-8))
                 
-            # 反向传播与优化
-            loss.backward()
+            # 🚀 替换原来的 loss.backward()
+            scaler.scale(loss).backward()
             
+            # 🚀 替换原来的梯度裁剪和 optimizer.step()
+            scaler.unscale_(optimizer) 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
             
-            optimizer.step()
-            
+            scaler.step(optimizer)
+            scaler.update()
+                        
             # ========== 【新增：步进更新 EMA 参数】 ========== 
             # 🔥 更新也只拿纯净的活跃权重进行平滑，绝不打断编译引擎 
             raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model 
