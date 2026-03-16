@@ -110,7 +110,8 @@ class ST_VSR_Network(nn.Module):
                 f_prev = self.shallow_feat_extract(lr_prev)
                 f_curr = self.shallow_feat_extract(lr_curr)
                 f_next = self.shallow_feat_extract(lr_next)
-                fused_spatial = self.time_cond_fusion(torch.cat([f_prev, f_curr, f_next, t_map], dim=1))
+                # 修改后 (强制 t_map 对齐 f_prev 的精度)
+                fused_spatial = self.time_cond_fusion(torch.cat([f_prev, f_curr, f_next, t_map.to(f_prev.dtype)], dim=1))
             else:
                 fused_spatial = self.shallow_feat_extract(lr_curr) # Ablation: 退化为单帧
         else:
@@ -125,7 +126,8 @@ class ST_VSR_Network(nn.Module):
             z_prev, z_curr, z_next = latent[:, 0], latent[:, 1], latent[:, 2]
 
         if self.use_time_cond:
-            fused_latent = self.vae_decoder(torch.cat([z_prev, z_curr, z_next, t_map_latent], dim=1))
+            # 修改后 (强制 t_map_latent 对齐 z_prev 的精度)
+            fused_latent = self.vae_decoder(torch.cat([z_prev, z_curr, z_next, t_map_latent.to(z_prev.dtype)], dim=1))
         else:
             fused_latent = self.vae_decoder(z_curr) # Ablation: 退化为单帧
 
@@ -154,7 +156,7 @@ class ST_VSR_Network(nn.Module):
         rel_coords = torch.cat([rel_xy, coords[..., 2:3]], dim=-1)
         encoded_coords = self.pe(rel_coords) 
         
-        inr_input = torch.cat([sampled_feat, encoded_coords], dim=-1).contiguous() 
+        inr_input = torch.cat([sampled_feat, encoded_coords.to(sampled_feat.dtype)], dim=-1).contiguous()
         pred_residual = self.inr_mlp(inr_input) 
 
         # ========== 🧠 拯救残差的物理底图混合器 (Dynamic Base Blending) ==========
@@ -168,7 +170,7 @@ class ST_VSR_Network(nn.Module):
             base_c = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
             base_n = F.grid_sample(lr_next, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
             
-            base_rgb = w_p * base_p + w_c * base_c + w_n * base_n
+            base_rgb = w_p.to(base_p.dtype) * base_p + w_c.to(base_c.dtype) * base_c + w_n.to(base_n.dtype) * base_n
         else:
             base_rgb = F.grid_sample(lr_curr, spatial_coords, mode='bicubic', padding_mode='border', align_corners=False).squeeze(2).permute(0, 2, 1)
 
