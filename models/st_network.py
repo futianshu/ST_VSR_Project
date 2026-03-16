@@ -28,9 +28,9 @@ class ResBlock(nn.Module):
         return x + self.conv2(self.relu(self.conv1(x)))
 
 class ST_VSR_Network(nn.Module):
-    def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers", use_taiem=True, use_shallow_cnn=True):
+    def __init__(self, sd3_path="stabilityai/stable-diffusion-3-medium-diffusers", use_time_cond=True, use_shallow_cnn=True):
         super().__init__()
-        self.use_taiem = use_taiem
+        self.use_time_cond = use_time_cond
         self.use_shallow_cnn = use_shallow_cnn
         
         print("🚀 正在初始化 SD3 VAE 作为生成先验提取器...")
@@ -47,7 +47,7 @@ class ST_VSR_Network(nn.Module):
         
         # ========== 核心 1：时间条件生成的 VAE 语义解压缩 ==========
         # 如果启用时序融合，输入为 [z_prev, z_curr, z_next, t_map] 共 16*3+1=49 通道
-        latent_in_channels = 49 if self.use_taiem else 16
+        latent_in_channels = 49 if self.use_time_cond else 16
         self.vae_decoder = nn.Sequential(
             nn.Conv2d(latent_in_channels, 256, 3, 1, 1),
             nn.PixelShuffle(2), nn.LeakyReLU(0.2, True),
@@ -100,7 +100,7 @@ class ST_VSR_Network(nn.Module):
 
         # --- 1. 物理时空流 (Pixel Space) ---
         if self.use_shallow_cnn:
-            if self.use_taiem:
+            if self.use_time_cond:
                 f_prev = self.shallow_feat_extract(lr_prev)
                 f_curr = self.shallow_feat_extract(lr_curr)
                 f_next = self.shallow_feat_extract(lr_next)
@@ -118,7 +118,7 @@ class ST_VSR_Network(nn.Module):
             latent = latent.reshape(B, T, 16, H // 8, W // 8)
             z_prev, z_curr, z_next = latent[:, 0], latent[:, 1], latent[:, 2]
 
-        if self.use_taiem:
+        if self.use_time_cond:
             fused_latent = self.vae_decoder(torch.cat([z_prev, z_curr, z_next, t_map_latent], dim=1))
         else:
             fused_latent = self.vae_decoder(z_curr) # Ablation: 退化为单帧
@@ -152,7 +152,7 @@ class ST_VSR_Network(nn.Module):
         pred_residual = self.inr_mlp(inr_input) 
 
         # ========== 🧠 拯救残差的物理底图混合器 (Dynamic Base Blending) ==========
-        if self.use_taiem:
+        if self.use_time_cond:
             t_chunk = coords[..., 2:3] # [B, N, 1]
             w_p = torch.relu(-t_chunk)         # 距离上一帧的权重 (t=-0.5时为0.5)
             w_n = torch.relu(t_chunk)          # 距离下一帧的权重 (t=0.5时为0.5)

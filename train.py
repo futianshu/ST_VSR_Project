@@ -76,11 +76,10 @@ def load_dpas_sr_prior(model, vae_safetensors_path):
 
 # ==========================================
 # 💡 实验名称配置 (每次做新消融实验前，只改这里！)
-# 可选值: "ablation_wo_taiem", "ablation_wo_shallow", "full_model"
 # ==========================================
-# EXP_NAME = "ablation_wo_taiem"  # 当前正在跑：移除 T_AIEM
-EXP_NAME = "ablation_wo_shallow"  # 当前正在跑：移除 shallow
-# EXP_NAME = "full_model"  # 当前正在跑：完整模型
+# EXP_NAME = "ablation_wo_time_cond"  # 当前正在跑：移除时间靶向 (证明 t_map 和动态底图对 tOF 的决定性作用)
+# EXP_NAME = "ablation_wo_shallow"      # 当前正在跑：移除物理浅层网络 (证明浅层 CNN 对 PSNR 边缘的锚定作用)
+EXP_NAME = "full_model"             # 当前正在跑：满血完全体
 # ==========================================
 
 def main():
@@ -97,15 +96,15 @@ def main():
     os.makedirs(f"checkpoints/{EXP_NAME}", exist_ok=True)
     
     # 💡 极其严谨的消融实验路由控制
-    if EXP_NAME == "ablation_wo_taiem":
-        model = ST_VSR_Network(use_taiem=False, use_shallow_cnn=True).to(device)
-        print("🧪 当前运行: 移除 T_AIEM 的消融实验")
+    if EXP_NAME == "ablation_wo_time_cond":
+        model = ST_VSR_Network(use_time_cond=False, use_shallow_cnn=True).to(device)
+        print("🧪 当前运行: 移除时间靶向 (Time-Condition) 的消融实验")
     elif EXP_NAME == "ablation_wo_shallow":
-        model = ST_VSR_Network(use_taiem=True, use_shallow_cnn=False).to(device)
-        print("🧪 当前运行: 移除 Shallow CNN 的消融实验")
+        model = ST_VSR_Network(use_time_cond=True, use_shallow_cnn=False).to(device)
+        print("🧪 当前运行: 移除物理流 (Shallow CNN) 的消融实验")
     else:
-        model = ST_VSR_Network(use_taiem=True, use_shallow_cnn=True).to(device)
-        print("🧪 当前运行: 满血完全体")
+        model = ST_VSR_Network(use_time_cond=True, use_shallow_cnn=True).to(device)
+        print("🧪 当前运行: 满血完全体 (双流 + 时间靶向)")
 
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
