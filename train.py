@@ -106,13 +106,6 @@ def main():
         model = ST_VSR_Network(use_time_cond=True, use_shallow_cnn=True).to(device)
         print("🧪 当前运行: 满血完全体 (双流 + 时间靶向)")
 
-    # 只编译我们自己写的无副作用的子模块
-    model.inr_mlp = torch.compile(model.inr_mlp)
-    if model.use_shallow_cnn:
-        model.shallow_feat_extract = torch.compile(model.shallow_feat_extract)
-        if model.use_time_cond:
-            model.time_cond_fusion = torch.compile(model.time_cond_fusion)
-
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
     # ==============================================================
@@ -206,13 +199,6 @@ def main():
     # 2. EMA 只绑定纯净网络，彻底和 compile 解耦！ 
     ema_model = AveragedModel(raw_model, multi_avg_fn=get_ema_multi_avg_fn(0.999)) 
     
-    # ❌ 彻底注释掉或删除这段 compile 代码！
-    # try:
-    #     model = torch.compile(model)
-    #     print("✅ 模型已启用 torch.compile 编译优化！")
-    # except Exception as e:
-    #     print(f"⚠️ torch.compile 启用失败: {e}")
-        
     # ========== 【核心修复：动态适配 EMA 权重前缀】 ========== 
     if ema_state_dict_cache is not None: 
         # 获取当前 EMA 模型实际需要的前缀 
@@ -325,8 +311,12 @@ def main():
                 coords_xyt = coords_xyt.to(device, non_blocking=True) 
                 gt_rgb_points = gt_rgb_points.to(device, non_blocking=True) 
                 
-                pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000) 
-                pred_rgb_clamped = torch.clamp(pred_rgb, 0.0, 1.0) 
+                # 🚀 验证集推理也必须开启半精度，否则全分辨率下 VAE 必爆显存！
+                with torch.cuda.amp.autocast():
+                    pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000) 
+                
+                # 强制转回 float32 再做 clamp 和指标计算，保证精度
+                pred_rgb_clamped = torch.clamp(pred_rgb.float(), 0.0, 1.0) 
                 
                 B, N, _ = pred_rgb_clamped.shape 
                 h, w = int(h_batch[0]), int(w_batch[0]) 
