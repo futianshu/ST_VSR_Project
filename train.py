@@ -204,17 +204,28 @@ def main():
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
             
-            # ========== 🚀 终极防线：断点字典高压清洗 ==========
-            # 强行把读取到的旧断点权重全部转为 FP32，彻底切断 FP16 感染源！
+            # ========== 🚀 终极防线 1：模型权重高压清洗 ==========
             clean_model_dict = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in checkpoint['model_state_dict'].items()}
-            
-            # 先加载基础模型权重
             model.load_state_dict(clean_model_dict, strict=False)
-            # ====================================================
-
-            if 'optimizer_state_dict' in checkpoint: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            # 🌟 新增：如果旧断点里有判别器的状态，也加载进来（第一次转 GAN 时没有，会自动跳过，这是正常的）
-            if 'optimizer_D_state_dict' in checkpoint: optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
+            
+            # ========== 🚀 终极防线 2：优化器状态高压清洗 (解决本次 Bug 的绝对核心) ==========
+            # 强行把旧断点里的动量全部转为 FP32，彻底切断 FP16 感染源！
+            if 'optimizer_state_dict' in checkpoint: 
+                opt_state = checkpoint['optimizer_state_dict']
+                for state in opt_state['state'].values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.float() # 彻底洗掉 FP16 的动量
+                optimizer.load_state_dict(opt_state)
+                
+            if 'optimizer_D_state_dict' in checkpoint: 
+                opt_d_state = checkpoint['optimizer_D_state_dict']
+                for state in opt_d_state['state'].values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.float()
+                optimizer_D.load_state_dict(opt_d_state)
+            # =================================================================================
 
             if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if 'scheduler_D_state_dict' in checkpoint: scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
@@ -222,11 +233,10 @@ def main():
             if 'best_psnr' in checkpoint: best_psnr = checkpoint['best_psnr']
             
             if 'ema_model_state_dict' in checkpoint:
-                # EMA 权重同样需要强制洗清
                 ema_state_dict_cache = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in checkpoint['ema_model_state_dict'].items()}
                 
             start_epoch = checkpoint['epoch'] + 1
-            print(f"\n✅ 成功加载并清洗完整断点：{checkpoint_path}")
+            print(f"\n✅ 成功加载并【深度清洗】完整断点：{checkpoint_path}")
             print(f"🚀 将直接从 Epoch {start_epoch} 开始无缝续训！当前最高 PSNR: {best_psnr:.2f} dB\n")
         else:
             raise FileNotFoundError(f"❌ 严重错误：找不到断点文件 {checkpoint_path}，请检查路径！")
