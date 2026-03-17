@@ -39,6 +39,23 @@ class CharbonnierLoss(torch.nn.Module):
         diff = x - y 
         return torch.mean(torch.sqrt(diff * diff + self.eps)) 
 
+class PatchGANDiscriminator(torch.nn.Module):
+    def __init__(self, in_channels=3, ndf=64):
+        super().__init__()
+        # 带有谱归一化的 PatchGAN，训练极其稳定，专治生成伪影
+        self.main = torch.nn.Sequential(
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(in_channels, ndf, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf, ndf, 4, 2, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf, ndf*2, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*2, ndf*2, 4, 2, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*2, ndf*4, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*4, ndf*4, 4, 2, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*4, ndf*8, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
+            torch.nn.Conv2d(ndf*8, 1, 4, 1, 1)
+        )
+    def forward(self, x):
+        return self.main(x)
+
 def load_dpas_sr_prior(model, vae_safetensors_path):
     if os.path.exists(vae_safetensors_path):
         print(f"🚀 正在提取研究二的图像生成先验: {vae_safetensors_path}")
@@ -108,6 +125,12 @@ def main():
 
     load_dpas_sr_prior(model, "/home/ubuntu/lib/hsh/TSD-SR/checkpoint/tsdsr/vae.safetensors")
     
+    # ========== 🚀 终极杀手锏：洗清所有 FP16 脏权重 ==========
+    # 强制将整个模型统一洗回纯 FP32。
+    # 只有底层是 100% 纯 FP32，AMP 才能正常且安全地进行混合精度缩放！
+    model = model.float()
+    # ==========================================================
+
     # ==============================================================
     # 🚀 1. 数据集初始化与 Loss 实例化 (保持不变)
     # ==============================================================
@@ -157,37 +180,55 @@ def main():
     # 🚀 级别 2 提速：初始化 AMP 的 GradScaler (加在这里！)
     scaler = torch.cuda.amp.GradScaler() # 如果你是 3090/A100/H100，可以直接无脑用 bfloat16 连 scaler 都省了，但如果是 V100 老老实实用 Scaler
     
+    # ---------------- 🚀 新增：判别器与 GAN Loss 初始化 ----------------
+    discriminator = PatchGANDiscriminator().to(device)
+    # 判别器学习率通常设为生成器的一半，防止 D 过强导致 G 梯度消失
+    optimizer_D = optim.AdamW(discriminator.parameters(), lr=1e-4, betas=(0.9, 0.999), fused=True)
+    scheduler_D = optim.lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=epochs, eta_min=1e-6)
+    loss_fn_gan = torch.nn.BCEWithLogitsLoss().to(device)
+    # -----------------------------------------------------------------
+
     # ==============================================================
     # 🚀 3. 加载断点权重
     # ==============================================================
-    resume_epoch = 0  # 只要这个数字大于 0，就会触发读取分支
+    resume_epoch = 1  # 只要这个数字大于 0，就会触发读取分支
     start_epoch = 1
     best_psnr = 0.0  
     
     ema_state_dict_cache = None # 缓存 EMA 权重
     
     if resume_epoch > 0:
-        # 🌟 核心修改：直接无脑读取 latest 存档，不要用数字拼接去猜！
+        # 🌟 核心修改：直接无脑读取 latest 存档
         checkpoint_path = f"checkpoints/{EXP_NAME}/st_vsr_latest.pth" 
         
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            # 先加载基础模型权重
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             
+            # ========== 🚀 终极防线：断点字典高压清洗 ==========
+            # 强行把读取到的旧断点权重全部转为 FP32，彻底切断 FP16 感染源！
+            clean_model_dict = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in checkpoint['model_state_dict'].items()}
+            
+            # 先加载基础模型权重
+            model.load_state_dict(clean_model_dict, strict=False)
+            # ====================================================
+
             if 'optimizer_state_dict' in checkpoint: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # 🌟 新增：如果旧断点里有判别器的状态，也加载进来（第一次转 GAN 时没有，会自动跳过，这是正常的）
+            if 'optimizer_D_state_dict' in checkpoint: optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
+
             if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scheduler_D_state_dict' in checkpoint: scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
+            
             if 'best_psnr' in checkpoint: best_psnr = checkpoint['best_psnr']
             
             if 'ema_model_state_dict' in checkpoint:
-                ema_state_dict_cache = checkpoint['ema_model_state_dict']
+                # EMA 权重同样需要强制洗清
+                ema_state_dict_cache = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in checkpoint['ema_model_state_dict'].items()}
                 
-            # 🌟 模型会自动从存档里读出它上次存活在第几个 epoch，并自动 +1
             start_epoch = checkpoint['epoch'] + 1
-            print(f"\n✅ 成功加载完整断点：{checkpoint_path}")
+            print(f"\n✅ 成功加载并清洗完整断点：{checkpoint_path}")
             print(f"🚀 将直接从 Epoch {start_epoch} 开始无缝续训！当前最高 PSNR: {best_psnr:.2f} dB\n")
         else:
-            # 🚨 加上这句报警！如果文件不存在直接报错退出，决不允许静默从头跑！
             raise FileNotFoundError(f"❌ 严重错误：找不到断点文件 {checkpoint_path}，请检查路径！")
 
     # ==============================================================
@@ -234,20 +275,16 @@ def main():
         train_pbar = tqdm(train_dataloader, desc=f"Train Epoch {epoch}/{epochs}")
         
         for step, (lr_seq, coords_xyt, gt_rgb_points) in enumerate(train_pbar):
-            lr_seq = lr_seq.to(device, non_blocking=True)               
-            coords_xyt = coords_xyt.to(device, non_blocking=True)       
-            gt_rgb_points = gt_rgb_points.to(device, non_blocking=True) 
-            
+            # ==============================================================
+            # 🚀 阶段 1：训练生成器 (Generator)
+            # ==============================================================
             optimizer.zero_grad(set_to_none=True)
             
-            # 🚀 开启自动混合精度上下文 (替换了原来的“纯 FP32 正向传播”)
             with torch.cuda.amp.autocast():
                 pred_rgb = model(lr_seq, coords_xyt) 
                 
-                # 计算 L1 损失
                 loss_l1 = charbonnier(pred_rgb, gt_rgb_points)
                 
-                # 动态计算 Patch 尺寸
                 B, N, _ = pred_rgb.shape 
                 current_patch_size = int(math.sqrt(N))  
                 pred_patch = pred_rgb.permute(0, 2, 1).reshape(B, 3, current_patch_size, current_patch_size) 
@@ -255,41 +292,61 @@ def main():
                 
                 # 计算感知损失
                 loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
-                loss = loss_l1 + 0.1 * loss_perceptual 
+                
+                # 计算生成器的对抗损失 (骗过判别器)
+                fake_preds_for_G = discriminator(pred_patch)
+                loss_G_adv = loss_fn_gan(fake_preds_for_G, torch.ones_like(fake_preds_for_G))
+                
+                # 🔥 终极权重平衡：L1 退居二线，感知和对抗主导纹理生成
+                loss_G = 1.0 * loss_l1 + 1.0 * loss_perceptual + 0.1 * loss_G_adv 
             
-            # (PSNR 计算保持在 FP32 且不需要梯度)
+            # 计算 PSNR (仅用作监控)
             with torch.no_grad():
-                pred_rgb_clamped = torch.clamp(pred_rgb.float(), 0.0, 1.0) # 强制转回 float32 算 PSNR 避免精度溢出
+                pred_rgb_clamped = torch.clamp(pred_rgb.float(), 0.0, 1.0) 
                 mse_loss = F.mse_loss(pred_rgb_clamped, gt_rgb_points)
                 psnr = 10 * torch.log10(1.0 / (mse_loss + 1e-8))
                 
-            # 🚀 替换原来的 loss.backward()
-            scaler.scale(loss).backward()
-            
-            # 🚀 替换原来的梯度裁剪和 optimizer.step()
+            scaler.scale(loss_G).backward()
             scaler.unscale_(optimizer) 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
-            
             scaler.step(optimizer)
+            
+            # ==============================================================
+            # 🚀 阶段 2：训练判别器 (Discriminator)
+            # ==============================================================
+            optimizer_D.zero_grad(set_to_none=True)
+            
+            with torch.cuda.amp.autocast():
+                # 给真实高清图像打高分
+                real_preds = discriminator(gt_patch.detach())
+                loss_D_real = loss_fn_gan(real_preds, torch.ones_like(real_preds))
+                
+                # 给生成的图像打低分 (detach 阻断梯度传回生成器)
+                fake_preds = discriminator(pred_patch.detach())
+                loss_D_fake = loss_fn_gan(fake_preds, torch.zeros_like(fake_preds))
+                
+                loss_D = (loss_D_real + loss_D_fake) / 2.0
+                
+            scaler.scale(loss_D).backward()
+            scaler.unscale_(optimizer_D)
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            scaler.step(optimizer_D)
+            
             scaler.update()
-                        
-            # ========== 【新增：步进更新 EMA 参数】 ========== 
-            # 🔥 更新也只拿纯净的活跃权重进行平滑，绝不打断编译引擎 
+            
+            # 更新 EMA 权重
             raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model 
             ema_model.update_parameters(raw_model) 
-            # ================================================= 
             
-            # 更新进度条信息 (新增 PSNR 和 当前的学习率 LR)
             current_lr = optimizer.param_groups[0]['lr']
             train_pbar.set_postfix({
-                'Loss': f"{loss.item():.4f}", 
-                'L1': f"{loss_l1.item():.4f}", 
-                'LPIPS': f"{loss_perceptual.item():.4f}",
+                'L_G': f"{loss_G.item():.3f}", 
+                'L_D': f"{loss_D.item():.3f}", 
+                'Adv': f"{loss_G_adv.item():.3f}",
                 'PSNR': f"{psnr.item():.2f}",
                 'LR': f"{current_lr:.2e}"
             })
             
-            # 🔥 强制垃圾回收
             del lr_seq, coords_xyt, gt_rgb_points, pred_rgb
             
         # ==============================================================
@@ -385,10 +442,12 @@ def main():
         # 打包保存所有关键状态 
         checkpoint_dict = { 
             'epoch': epoch, 
-            'model_state_dict': model_save_dict,          # 🌟 绝对纯净的活跃权重 
-            'ema_model_state_dict': ema_save_dict,        # 🌟 绝对纯净的平滑权重 
+            'model_state_dict': model_save_dict,          
+            'ema_model_state_dict': ema_save_dict,        
             'optimizer_state_dict': optimizer.state_dict(), 
+            'optimizer_D_state_dict': optimizer_D.state_dict(),  # 🌟 保存判别器的优化器
             'scheduler_state_dict': scheduler.state_dict(), 
+            'scheduler_D_state_dict': scheduler_D.state_dict(),  # 🌟 保存判别器的学习率
             'best_psnr': max(best_psnr, val_psnr_avg) 
         }
         

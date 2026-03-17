@@ -98,38 +98,63 @@ class ST_VSR_Network(nn.Module):
         B, T, C, H, W = lr_seq.shape
         lr_prev, lr_curr, lr_next = lr_seq[:, 0], lr_seq[:, 1], lr_seq[:, 2]
         
+        # ========== 🚀 终极防崩溃：动态计算 8 的倍数 Padding ==========
+        # 训练时 patch_size 是 8 的倍数，这里不会触发；推理时遇到任意分辨率，自动补齐
+        H_pad = math.ceil(H / 8) * 8
+        W_pad = math.ceil(W / 8) * 8
+        pad_h = H_pad - H
+        pad_w = W_pad - W
+        
         # 🧠 灵魂设计：将当前查询的时间 t_q 广播成特征图
-        # 让具有空间感受野的 CNN 直接看见“目标时间”，从而主动扭曲/移动特征
         t_q = coords_xyt[:, 0, 2].view(B, 1, 1, 1) 
         t_map = t_q.expand(B, 1, H, W).contiguous()
-        t_map_latent = t_q.expand(B, 1, H // 8, W // 8).contiguous()
+        # 注意：这里的 Latent 时间图必须和 Pad 后的尺寸对齐
+        t_map_latent = t_q.expand(B, 1, H_pad // 8, W_pad // 8).contiguous()
 
         # --- 1. 物理时空流 (Pixel Space) ---
+        # 物理流不经过 VAE 压缩，继续保留极其精确的原始 H, W 尺寸
         if self.use_shallow_cnn:
             if self.use_time_cond:
                 f_prev = self.shallow_feat_extract(lr_prev)
                 f_curr = self.shallow_feat_extract(lr_curr)
                 f_next = self.shallow_feat_extract(lr_next)
-                # 修改后 (强制 t_map 对齐 f_prev 的精度)
+                # 强制 t_map 对齐 f_prev 的精度
                 fused_spatial = self.time_cond_fusion(torch.cat([f_prev, f_curr, f_next, t_map.to(f_prev.dtype)], dim=1))
             else:
-                fused_spatial = self.shallow_feat_extract(lr_curr) # Ablation: 退化为单帧
+                fused_spatial = self.shallow_feat_extract(lr_curr) 
         else:
             fused_spatial = 0.0
 
         # --- 2. 语义生成流 (SD3 VAE) ---
         with torch.no_grad():
-            lr_seq_input = lr_seq.reshape(B*T, C, H, W) * 2.0 - 1.0
-            latent = self.encoder.encode(lr_seq_input).latent_dist.mode()
+            # 强制关闭 autocast，让 VAE 运行在纯 FP32 下，避开 V100 硬件 Bug
+            with torch.cuda.amp.autocast(enabled=False):
+                lr_seq_input = lr_seq.float().reshape(B*T, C, H, W) * 2.0 - 1.0
+                
+                # 🚀 执行边缘 Pad，安全补齐至 8 的倍数
+                if pad_h > 0 or pad_w > 0:
+                    lr_seq_input = F.pad(lr_seq_input, (0, pad_w, 0, pad_h), mode='replicate')
+                
+                vae_chunk_size = 12 
+                latents = []
+                for i in range(0, B*T, vae_chunk_size):
+                    chunk_in = lr_seq_input[i:i+vae_chunk_size].contiguous()
+                    chunk_latent = self.encoder.encode(chunk_in).latent_dist.mode()
+                    latents.append(chunk_latent)
+                latent = torch.cat(latents, dim=0)
+            
             latent = (latent.float() - 0.0609) * 1.5305
-            latent = latent.reshape(B, T, 16, H // 8, W // 8)
+            latent = latent.reshape(B, T, 16, H_pad // 8, W_pad // 8)
             z_prev, z_curr, z_next = latent[:, 0], latent[:, 1], latent[:, 2]
 
         if self.use_time_cond:
-            # 修改后 (强制 t_map_latent 对齐 z_prev 的精度)
             fused_latent = self.vae_decoder(torch.cat([z_prev, z_curr, z_next, t_map_latent.to(z_prev.dtype)], dim=1))
         else:
-            fused_latent = self.vae_decoder(z_curr) # Ablation: 退化为单帧
+            fused_latent = self.vae_decoder(z_curr) 
+            
+        # 🚀 还原裁剪：将 VAE 生成的特征图裁剪回原始长宽，以便与物理流 100% 对齐
+        if pad_h > 0 or pad_w > 0:
+            fused_latent = fused_latent[:, :, :H, :W]
 
         final_feat = fused_spatial + fused_latent
 
@@ -156,8 +181,13 @@ class ST_VSR_Network(nn.Module):
         rel_coords = torch.cat([rel_xy, coords[..., 2:3]], dim=-1)
         encoded_coords = self.pe(rel_coords) 
         
-        inr_input = torch.cat([sampled_feat, encoded_coords.to(sampled_feat.dtype)], dim=-1).contiguous()
-        pred_residual = self.inr_mlp(inr_input) 
+        # =========================================================================
+        # 🚀 终极排雷：关闭 autocast，强制转为 FP32。
+        # 彻底避开 V100 在反向传播时处理 200 万行超大矩阵的 FP16 溢出 Bug！
+        with torch.cuda.amp.autocast(enabled=False):
+            inr_input = torch.cat([sampled_feat.float(), encoded_coords.float()], dim=-1).contiguous()
+            pred_residual = self.inr_mlp(inr_input) 
+        # =========================================================================
 
         # ========== 🧠 拯救残差的物理底图混合器 (Dynamic Base Blending) ==========
         if self.use_time_cond:
