@@ -42,19 +42,32 @@ class CharbonnierLoss(torch.nn.Module):
 class PatchGANDiscriminator(torch.nn.Module):
     def __init__(self, in_channels=3, ndf=64):
         super().__init__()
-        # 带有谱归一化的 PatchGAN，训练极其稳定，专治生成伪影
+        # 🚀 彻底抛弃 V100 兼容性极差的 spectral_norm
+        # 换用最经典、硬件兼容性 100% 的 Pix2Pix 架构 (Conv + InstanceNorm + LeakyReLU)
         self.main = torch.nn.Sequential(
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(in_channels, ndf, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf, ndf, 4, 2, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf, ndf*2, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*2, ndf*2, 4, 2, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*2, ndf*4, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*4, ndf*4, 4, 2, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.utils.spectral_norm(torch.nn.Conv2d(ndf*4, ndf*8, 3, 1, 1)), torch.nn.LeakyReLU(0.2, True),
-            torch.nn.Conv2d(ndf*8, 1, 4, 1, 1)
+            # 第一层通常不加 Norm
+            torch.nn.Conv2d(in_channels, ndf, 4, 2, 1), 
+            torch.nn.LeakyReLU(0.2, True),
+            
+            torch.nn.Conv2d(ndf, ndf*2, 4, 2, 1), 
+            torch.nn.InstanceNorm2d(ndf*2),
+            torch.nn.LeakyReLU(0.2, True),
+            
+            torch.nn.Conv2d(ndf*2, ndf*4, 4, 2, 1), 
+            torch.nn.InstanceNorm2d(ndf*4),
+            torch.nn.LeakyReLU(0.2, True),
+            
+            torch.nn.Conv2d(ndf*4, ndf*8, 3, 1, 1), 
+            torch.nn.InstanceNorm2d(ndf*8),
+            torch.nn.LeakyReLU(0.2, True),
+            
+            torch.nn.Conv2d(ndf*8, 1, 3, 1, 1)
         )
+        
     def forward(self, x):
-        return self.main(x)
+        # 保持纯 FP32 运行，绝对安全
+        with torch.amp.autocast('cuda', enabled=False):
+            return self.main(x.float())
 
 def load_dpas_sr_prior(model, vae_safetensors_path):
     if os.path.exists(vae_safetensors_path):
@@ -173,7 +186,7 @@ def main():
     # 🚀 2. 定义优化器
     # ==============================================================
     # 🔥 加上 fused=True 开启内核融合提速
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, fused=True)
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
     epochs = 100
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
@@ -183,7 +196,7 @@ def main():
     # ---------------- 🚀 新增：判别器与 GAN Loss 初始化 ----------------
     discriminator = PatchGANDiscriminator().to(device)
     # 判别器学习率通常设为生成器的一半，防止 D 过强导致 G 梯度消失
-    optimizer_D = optim.AdamW(discriminator.parameters(), lr=1e-4, betas=(0.9, 0.999), fused=True)
+    optimizer_D = optim.AdamW(discriminator.parameters(), lr=1e-4, betas=(0.9, 0.999))
     scheduler_D = optim.lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=epochs, eta_min=1e-6)
     loss_fn_gan = torch.nn.BCEWithLogitsLoss().to(device)
     # -----------------------------------------------------------------
@@ -217,6 +230,10 @@ def main():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.float() # 彻底洗掉 FP16 的动量
                 optimizer.load_state_dict(opt_state)
+
+                # 🚀 新增：强行将生成器学习率压低，收敛震荡，让纹理沉淀！
+                # for param_group in optimizer.param_groups:
+                #     param_group['lr'] = 5e-5
                 
             if 'optimizer_D_state_dict' in checkpoint: 
                 opt_d_state = checkpoint['optimizer_D_state_dict']
@@ -225,6 +242,10 @@ def main():
                         if isinstance(v, torch.Tensor):
                             state[k] = v.float()
                 optimizer_D.load_state_dict(opt_d_state)
+
+                # 🚀 新增：强行将判别器学习率压低
+                # for param_group in optimizer_D.param_groups:
+                #     param_group['lr'] = 5e-5
             # =================================================================================
 
             if 'scheduler_state_dict' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -274,6 +295,12 @@ def main():
         print("✅ 成功恢复 EMA 平滑权重历史！") 
     # =======================================================
 
+    # ========== 🚀 终极防线：开训前强制镇压所有 FP16 脏权重 ==========
+    model = model.float()
+    discriminator = discriminator.float()
+    ema_model.module = ema_model.module.float()
+    # =================================================================
+
     print("🔥 真实世界时空联合训练与验证正式开始！")
     
     for epoch in range(start_epoch, epochs + 1):
@@ -285,12 +312,18 @@ def main():
         train_pbar = tqdm(train_dataloader, desc=f"Train Epoch {epoch}/{epochs}")
         
         for step, (lr_seq, coords_xyt, gt_rgb_points) in enumerate(train_pbar):
+            # ========== 🚀 把这三行丢失的代码补回来！ ==========
+            lr_seq = lr_seq.to(device, non_blocking=True)               
+            coords_xyt = coords_xyt.to(device, non_blocking=True)       
+            gt_rgb_points = gt_rgb_points.to(device, non_blocking=True) 
+            # ====================================================
+
             # ==============================================================
             # 🚀 阶段 1：训练生成器 (Generator)
             # ==============================================================
             optimizer.zero_grad(set_to_none=True)
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 pred_rgb = model(lr_seq, coords_xyt) 
                 
                 loss_l1 = charbonnier(pred_rgb, gt_rgb_points)
@@ -304,11 +337,15 @@ def main():
                 loss_perceptual = loss_fn_vgg((pred_patch * 2.0 - 1.0), (gt_patch * 2.0 - 1.0)).mean() 
                 
                 # 计算生成器的对抗损失 (骗过判别器)
-                fake_preds_for_G = discriminator(pred_patch)
-                loss_G_adv = loss_fn_gan(fake_preds_for_G, torch.ones_like(fake_preds_for_G))
+                # fake_preds_for_G = discriminator(pred_patch)
+                # loss_G_adv = loss_fn_gan(fake_preds_for_G, torch.ones_like(fake_preds_for_G))
                 
                 # 🔥 终极权重平衡：L1 退居二线，感知和对抗主导纹理生成
-                loss_G = 1.0 * loss_l1 + 1.0 * loss_perceptual + 0.1 * loss_G_adv 
+                loss_G = 1.0 * loss_l1 + 0.1 * loss_perceptual
+                
+                # loss_G = 0.01 * loss_l1 + 1.0 * loss_perceptual + 0.5 * loss_G_adv 
+
+
             
             # 计算 PSNR (仅用作监控)
             with torch.no_grad():
@@ -324,23 +361,23 @@ def main():
             # ==============================================================
             # 🚀 阶段 2：训练判别器 (Discriminator)
             # ==============================================================
-            optimizer_D.zero_grad(set_to_none=True)
+            # optimizer_D.zero_grad(set_to_none=True)
             
-            with torch.cuda.amp.autocast():
-                # 给真实高清图像打高分
-                real_preds = discriminator(gt_patch.detach())
-                loss_D_real = loss_fn_gan(real_preds, torch.ones_like(real_preds))
+            # with torch.amp.autocast('cuda'):
+            #     # 给真实高清图像打高分
+            #     real_preds = discriminator(gt_patch.detach())
+            #     loss_D_real = loss_fn_gan(real_preds, torch.ones_like(real_preds))
                 
-                # 给生成的图像打低分 (detach 阻断梯度传回生成器)
-                fake_preds = discriminator(pred_patch.detach())
-                loss_D_fake = loss_fn_gan(fake_preds, torch.zeros_like(fake_preds))
+            #     # 给生成的图像打低分 (detach 阻断梯度传回生成器)
+            #     fake_preds = discriminator(pred_patch.detach())
+            #     loss_D_fake = loss_fn_gan(fake_preds, torch.zeros_like(fake_preds))
                 
-                loss_D = (loss_D_real + loss_D_fake) / 2.0
+            #     loss_D = (loss_D_real + loss_D_fake) / 2.0
                 
-            scaler.scale(loss_D).backward()
-            scaler.unscale_(optimizer_D)
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-            scaler.step(optimizer_D)
+            # scaler.scale(loss_D).backward()
+            # scaler.unscale_(optimizer_D)
+            # torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            # scaler.step(optimizer_D)
             
             scaler.update()
             
@@ -351,8 +388,8 @@ def main():
             current_lr = optimizer.param_groups[0]['lr']
             train_pbar.set_postfix({
                 'L_G': f"{loss_G.item():.3f}", 
-                'L_D': f"{loss_D.item():.3f}", 
-                'Adv': f"{loss_G_adv.item():.3f}",
+            #     'L_D': f"{loss_D.item():.3f}", 
+            #     'Adv': f"{loss_G_adv.item():.3f}",
                 'PSNR': f"{psnr.item():.2f}",
                 'LR': f"{current_lr:.2e}"
             })
@@ -379,8 +416,10 @@ def main():
                 gt_rgb_points = gt_rgb_points.to(device, non_blocking=True) 
                 
                 # 🚀 验证集推理也必须开启半精度，否则全分辨率下 VAE 必爆显存！
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
+                    # ✅ 阶段一：务必用 ema_model 评估！
                     pred_rgb = ema_model(lr_seq, coords_xyt, chunk_size=30000) 
+                    # pred_rgb = model(lr_seq, coords_xyt, chunk_size=30000) 
                 
                 # 强制转回 float32 再做 clamp 和指标计算，保证精度
                 pred_rgb_clamped = torch.clamp(pred_rgb.float(), 0.0, 1.0) 

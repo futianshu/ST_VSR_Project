@@ -50,7 +50,8 @@ def main():
     # 加载 EMA 断点权重（测试时必须用 EMA 以保证时序极致平滑）
     print(f"📦 正在加载模型权重: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint['ema_model_state_dict'], strict=False)
+    # model.load_state_dict(checkpoint['ema_model_state_dict'], strict=False)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
 
     # 读取测试序列
