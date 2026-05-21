@@ -1,8 +1,16 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+import sys
+from pathlib import Path
+
 import torch
 from thop import profile, clever_format
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from models.st_network import ST_VSR_Network
 
 def count_parameters(model):

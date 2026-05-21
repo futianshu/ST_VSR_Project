@@ -2,6 +2,8 @@ import os
 import torch
 from torch.utils.data import Dataset
 import cv2
+import numpy as np
+import torchvision.transforms.functional as TF
 
 class Vimeo90K_ST_Dataset(Dataset):
     def __init__(self, data_root, scale=4, patch_size=48):
@@ -21,7 +23,6 @@ class Vimeo90K_ST_Dataset(Dataset):
         vid_dir = os.path.join(self.data_root, 'sequences', self.video_paths[idx])
         
         # 1. 巧妙的输入采样：间隔抽取 3 帧作为 LR 输入
-        # 彻底移除 random，换成多进程安全的 torch.randint 
         start_idx = int(torch.randint(1, 4, (1,)).item()) 
         input_indices = [start_idx, start_idx + 2, start_idx + 4] # 例: im1, im3, im5
         
@@ -51,48 +52,51 @@ class Vimeo90K_ST_Dataset(Dataset):
         gt_img = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB) 
         gt_hr_full = torch.from_numpy(gt_img).float().permute(2, 0, 1) / 255.0 # [3, H, W] 
 
-        # ========== 【🔥 修复：将数据增强提前到全图级别】 ========== 
+        # ========== 数据增强 (空间与时序) ========== 
         if torch.rand(1).item() < 0.5: # 水平翻转 
-            hr_tensor = torch.flip(hr_tensor, dims=[3])  # 4D的宽是 dim 3 
-            gt_hr_full = torch.flip(gt_hr_full, dims=[2]) # 3D的宽是 dim 2 
+            hr_tensor = torch.flip(hr_tensor, dims=[3])  
+            gt_hr_full = torch.flip(gt_hr_full, dims=[2]) 
             
         if torch.rand(1).item() < 0.5: # 垂直翻转 
             hr_tensor = torch.flip(hr_tensor, dims=[2]) 
-            gt_hr_full = torch.flip(gt_hr_full, dims=[1]) 
+            # 修正：gt_hr_full 的 shape 是 [3, H, W]，dim 1 对应的是 H (高度)
+            gt_hr_full = torch.flip(gt_hr_full, dims=[1])
             
         if torch.rand(1).item() < 0.5: # 时序反转 
             hr_tensor = torch.flip(hr_tensor, dims=[0]) 
             t_q = -t_q 
-        # ======================================================== 
-        
-        # 🔥 新增：消除 flip 带来的负步长，强制内存连续，防止 interpolate 崩溃！ 
+            
         hr_tensor = hr_tensor.contiguous() 
         gt_hr_full = gt_hr_full.contiguous() 
         
-        # 2. 增强后再下采样 (此时出来的 LR 已经是翻转同步过的) 
-        lr_tensor = torch.nn.functional.interpolate(hr_tensor, scale_factor=1/self.scale, mode='bicubic', antialias=True) 
-        
-        # 3. 随机裁剪 Patch (改用 torch.randint 防止多进程种子冲突) 
+        # ========== 🌟 核心提速修改：移除所有 CPU 退化操作 ==========
+        # 我们直接将纯净的高清帧 hr_tensor 送出，把脏活累活全部交给 GPU！
+        # ==========================================================
+
+        # ========== 🌟 终极核心修复：裁切对齐与坐标系重置 ==========
+        # 3. 随机裁剪 Patch
         y0 = torch.randint(0, H_hr - self.patch_size + 1, (1,)).item() 
         x0 = torch.randint(0, W_hr - self.patch_size + 1, (1,)).item() 
+        
+        # 🚀 修复 1：必须同步裁剪 hr_tensor！
+        # 这样 GPU 退化流和 CNN 只需要处理微小的 Patch，显存和算力开销暴降 75%！
+        hr_tensor = hr_tensor[:, :, y0:y0+self.patch_size, x0:x0+self.patch_size]
         gt_patch = gt_hr_full[:, y0:y0+self.patch_size, x0:x0+self.patch_size] 
         
-        # 5. 生成对应的 3D 时空坐标
-        # ✅ 改为像素中心对齐 (加 0.5，除以 H，严格匹配 align_corners=False) 
-        y_coords = (torch.arange(H_hr, dtype=torch.float32) + 0.5) / H_hr * 2.0 - 1.0 
-        x_coords = (torch.arange(W_hr, dtype=torch.float32) + 0.5) / W_hr * 2.0 - 1.0
+        # 🚀 修复 2：将坐标系强行锚定在当前 Patch 上
+        # 因为输入的图已经变成了 Patch，所以这片 Patch 就是目前的“整个物理世界”
+        y_coords = (torch.arange(self.patch_size, dtype=torch.float32) + 0.5) / self.patch_size * 2.0 - 1.0 
+        x_coords = (torch.arange(self.patch_size, dtype=torch.float32) + 0.5) / self.patch_size * 2.0 - 1.0
         
-        patch_y_coords = y_coords[y0:y0+self.patch_size]
-        patch_x_coords = x_coords[x0:x0+self.patch_size]
-        grid_y, grid_x = torch.meshgrid(patch_y_coords, patch_x_coords, indexing='ij')
-        
+        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
         coords_xy = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+        
         t_tensor = torch.full((coords_xy.shape[0], 1), t_q) 
         coords_xyt = torch.cat([coords_xy, t_tensor], dim=-1) # [N, 3]
         
         gt_rgb_points = gt_patch.reshape(3, -1).permute(1, 0) # [N, 3]
         
-        return lr_tensor, coords_xyt, gt_rgb_points
+        return hr_tensor, coords_xyt, gt_rgb_points
 
 class Vimeo90K_ST_Val_Dataset(Dataset): 
     """ 

@@ -5,11 +5,49 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
 # Virtual environments
-.venv
+.venv/
+.venv-mmagic/
+.env
+.env.*
 
+# Local editor / agent settings
+.claude/
+.codex/
+.agents/
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Training artifacts
 checkpoints/
 results/
 logs/
 bak/
+visual_comparisons/
+archive/
+outputs/
+*.log
+arbitrary_scale/
+arbitrary_scale_REDS4/
+arbitrary_scale_UDM10/
+runs/
+wandb/
+tensorboard/
+mlruns/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.mp4
+*.avi
+*.mov
